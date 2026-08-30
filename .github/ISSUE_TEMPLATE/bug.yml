@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible dictation, installation, or reliability problem
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Never include API keys, auth tokens, private transcripts, or sensitive audio.
+  - type: input
+    id: version
+    attributes:
+      label: Commit or release
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: macOS and Bun versions
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Redacted `bun run doctor:macos` output
+    validations:
+      required: true

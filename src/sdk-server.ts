@@ -2,7 +2,10 @@ import { GoogleSdkLiveTranscriber } from "./google-sdk-live.ts";
 import { createDaemon, type DaemonOptions } from "./server.ts";
 
 export function createSdkDaemon(
-  options: Pick<DaemonOptions, "speculativeIntelligence" | "warmConfig"> = {},
+  options: Pick<
+    DaemonOptions,
+    "authToken" | "hostname" | "port" | "speculativeIntelligence" | "warmConfig"
+  >,
 ) {
   const apiKey = Bun.env.GEMINI_API_KEY;
   return createDaemon({

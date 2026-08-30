@@ -31,22 +31,26 @@ The daemon binds to `127.0.0.1` by default. The Gemini API key stays in the daem
 - A Gemini API key with access to `gemini-3.5-transcribe-live`
 - macOS system mode: Xcode Command Line Tools and Karabiner-Elements
 
-## Install
+## Install with an AI coding agent
 
-```bash
-bun install
-cp .env.example .env
-```
+Give an agent access to the checkout and ask:
 
-Put `GEMINI_API_KEY` in the untracked `.env` file. Never commit the real key. Start the local
-daemon with `bun run serve`, or follow the macOS section below for system-wide dictation.
+> Read `AGENT_INSTALL.md` completely and install this project on my Mac. Do not expose secrets,
+> assume Homebrew or ffmpeg exists, or bypass macOS permission prompts. Finish by running the
+> project tests and `bun run doctor:macos`.
+
+The short, authoritative procedure is in [AGENT_INSTALL.md](AGENT_INSTALL.md). The agent checks and
+installs missing prerequisites, preserves an existing `.env`, generates machine-specific service
+configuration, and verifies the result. A person only needs to enter the Gemini key privately and
+approve Apple's Microphone, Accessibility, developer-tools, or signed-installer dialogs.
 
 ## Run locally
 
-Set the API key in the terminal that will run the daemon:
+For development without the system service, install dependencies, put the key in an untracked
+`.env`, and run one daemon:
 
 ```bash
-export GEMINI_API_KEY="your-key"
+bun install --frozen-lockfile
 bun run serve
 ```
 
@@ -75,35 +79,28 @@ Click into a text field in Chrome, VS Code, Terminal, or another macOS applicati
 
 1. Tap right Option to begin dictating.
 2. Tap right Option again to stop and polish.
-3. The finished text is copied to the macOS pasteboard and pasted into the focused field.
+3. The finished text is pasted into the original focused application and the previous clipboard is
+   restored. If focus moved to another application, the transcript is copied instead of pasted.
 
 The service plays a short sound when capture starts, when finalization begins, after successful
 insertion, or when an error occurs. Right Option is therefore usable without opening a status UI.
 
-Build and ad-hoc sign the native microphone helper:
+The agent-facing installer builds and ad-hoc signs the microphone helper, generates a protected
+local auth token, writes the LaunchAgent using the actual checkout and Bun paths, installs the
+Karabiner rule, and starts the service:
 
 ```bash
-bun run system:audio:build
-open macos/GeminiWhisperAudio.app --args --permission-only
+bun run install:macos
+bun run doctor:macos
 ```
 
 Allow `Gemini Whisper Audio` under **System Settings → Privacy & Security → Microphone**. Allow the
 installed Bun executable under **Privacy & Security → Accessibility**, because insertion uses
 System Events to paste into the focused application.
 
-The checked-in LaunchAgent contains this checkout's absolute paths. If the repository is cloned to
-a different location, update `ProgramArguments`, `WorkingDirectory`, log paths, and `PATH` in
-`macos/com.nithin.gemini-whisper.plist`, then install it:
-
-```bash
-cp macos/com.nithin.gemini-whisper.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nithin.gemini-whisper.plist
-launchctl kickstart -k gui/$(id -u)/com.nithin.gemini-whisper
-```
-
-Import `macos/karabiner-rule.json` from Karabiner-Elements' Complex Modifications screen. Its
-right-Option tap calls the loopback controller directly with `curl`; holding right Option continues
-to behave as a normal modifier.
+System-wide dictation does not require ffmpeg. The installer reports it as optional because only
+the standalone `mic`, `file`, and `devices` commands use it. Uninstall with
+`bun run uninstall:macos`; add `--purge` only to remove the per-user auth token too.
 
 The LaunchAgent is installed at `~/Library/LaunchAgents/com.nithin.gemini-whisper.plist` and starts
 automatically at login. Logs are written to `~/Library/Logs/gemini-whisper.log` and
@@ -137,7 +134,8 @@ Or stream an existing audio file in real time:
 bun run file ./sample.m4a --language en-IN
 ```
 
-Use `--verbatim` to preserve filler words and false starts. SMART mode is the default.
+Use `--verbatim` to preserve filler words and false starts; it also disables Flash-Lite polishing.
+Use `--no-polish` to keep SMART transcription while skipping the second model call.
 
 The microphone CLI uses manual activity boundaries by default: Gemini receives `activityStart`
 before microphone capture and `activityEnd` when Enter is pressed. This keeps natural pauses inside
@@ -148,13 +146,17 @@ low speech-end sensitivity, and a 1,000 ms silence threshold. Tune it with
 
 ## Local WebSocket protocol
 
-Connect to `ws://127.0.0.1:8765/v1/transcribe`. The server first emits `hello`. Start a Gemini session with:
+Connect to `ws://127.0.0.1:8765/v1/transcribe` using the WebSocket subprotocol
+`gemini-whisper-v1.<token>`. Native clients read the mode-`0600` token from
+`~/.config/gemini-whisper-local/auth-token`; browser-origin handshakes are rejected. The server
+first emits `hello`. Start a Gemini session with:
 
 ```json
 {
   "type": "start",
   "config": {
     "mode": "smart",
+    "polish": true,
     "vad": "hybrid",
     "languageCodes": [],
     "customVocabulary": ["Bun", "Gemini"]
@@ -199,8 +201,13 @@ curl http://127.0.0.1:8766/health
 
 - The API key is loaded only by the local daemon and is never sent to local WebSocket clients.
 - Both local servers bind to `127.0.0.1`; do not expose them through a public proxy.
+- State-changing HTTP routes require a bearer token; WebSockets require the matching authenticated
+  subprotocol. Browser `Origin` requests are rejected and connection rates are bounded.
+- The installer stores the random token at `~/.config/gemini-whisper-local/auth-token` with mode
+  `0600`. It must never be logged, shared, or committed.
 - `.env`, dependencies, build output, logs, and the generated signed app bundle are gitignored.
-- The localhost WebSocket currently has no application-level authentication.
+- This boundary protects against webpages and accidental clients, not malware already running as
+  the same macOS user. See [SECURITY.md](SECURITY.md).
 
 Measure the actual stop-to-polished path with a PCM16, mono, 16 kHz WAV. The warmup and trials are
 paced by 20 seconds by default to avoid exhausting Gemini Live session-rate quota:
@@ -225,6 +232,8 @@ Implemented core behavior:
 - Two automatic retries for unexpected Gemini WebSocket closures, with audio buffered during reconnect
 - Nine-minute safety cutoff before Gemini's ten-minute session limit
 - Microphone and audio-file producers
+- Authenticated, rate-limited loopback control and transcription APIs
+- Agent-driven macOS install, uninstall, and diagnostics
 - A documented, provider-independent localhost protocol
 
 Not yet included:
@@ -233,6 +242,9 @@ Not yet included:
 - Snippet expansion and spoken commands
 - Long-running session rotation
 - Transcript persistence
-- Local WebSocket authentication beyond binding to loopback
 
 Those are separate layers on top of the transcription core.
+
+## License
+
+[MIT](LICENSE)

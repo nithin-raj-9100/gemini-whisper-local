@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { LiveTranscriber } from "../src/gemini-live.ts";
 import { createDaemon } from "../src/server.ts";
+import { websocketAuthProtocol } from "../src/local-auth.ts";
 import type { ServerEvent } from "../src/types.ts";
+
+const TEST_AUTH_TOKEN = "a".repeat(64);
 
 class FakeTranscriber implements LiveTranscriber {
   audioBytes = 0;
@@ -35,6 +38,7 @@ describe("local daemon", () => {
   test("bridges binary audio to a live transcriber and emits transcript events", async () => {
     let fake: FakeTranscriber | undefined;
     const server = createDaemon({
+      authToken: TEST_AUTH_TOKEN,
       apiKey: "test-only",
       port: 0,
       quiet: true,
@@ -47,7 +51,10 @@ describe("local daemon", () => {
 
     try {
       const events: ServerEvent[] = [];
-      const socket = new WebSocket(`ws://127.0.0.1:${server.port}/v1/transcribe`);
+      const socket = new WebSocket(
+        `ws://127.0.0.1:${server.port}/v1/transcribe`,
+        websocketAuthProtocol(TEST_AUTH_TOKEN),
+      );
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as ServerEvent;
         events.push(event);
@@ -81,6 +88,7 @@ describe("local daemon", () => {
 
   test("polishes the accumulated final transcript before completing", async () => {
     const server = createDaemon({
+      authToken: TEST_AUTH_TOKEN,
       apiKey: "test-only",
       port: 0,
       quiet: true,
@@ -101,7 +109,10 @@ describe("local daemon", () => {
 
     try {
       const events: ServerEvent[] = [];
-      const socket = new WebSocket(`ws://127.0.0.1:${server.port}/v1/transcribe`);
+      const socket = new WebSocket(
+        `ws://127.0.0.1:${server.port}/v1/transcribe`,
+        websocketAuthProtocol(TEST_AUTH_TOKEN),
+      );
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as ServerEvent;
         events.push(event);
@@ -129,10 +140,58 @@ describe("local daemon", () => {
     }
   });
 
+  test("skips intelligence when polishing is disabled", async () => {
+    let polishCalls = 0;
+    const server = createDaemon({
+      authToken: TEST_AUTH_TOKEN,
+      apiKey: "test-only",
+      port: 0,
+      quiet: true,
+      sessionFactory(_config, emit) {
+        return new FakeTranscriber(emit);
+      },
+      intelligence: {
+        async polish() {
+          polishCalls++;
+          return { text: "unexpected", model: "test-flash-lite", latencyMs: 1 };
+        },
+      },
+    });
+
+    try {
+      const events: ServerEvent[] = [];
+      const socket = new WebSocket(
+        `ws://127.0.0.1:${server.port}/v1/transcribe`,
+        websocketAuthProtocol(TEST_AUTH_TOKEN),
+      );
+      socket.addEventListener("message", (message) => {
+        const event = JSON.parse(String(message.data)) as ServerEvent;
+        events.push(event);
+        if (event.type === "hello") {
+          socket.send(JSON.stringify({ type: "start", config: { polish: false } }));
+        }
+        if (event.type === "ready") socket.send(new Uint8Array(3200));
+        if (event.type === "interim") socket.send(JSON.stringify({ type: "stop" }));
+        if (event.type === "complete") socket.close();
+      });
+      await Promise.race([
+        new Promise<void>((resolve) => socket.addEventListener("close", () => resolve())),
+        Bun.sleep(2_000).then(() => {
+          throw new Error("No-polish integration test timed out.");
+        }),
+      ]);
+      expect(polishCalls).toBe(0);
+      expect(events.some((event) => event.type === "polished")).toBe(false);
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("starts speculative polishing before transcription finalization", async () => {
     let fake: FakeTranscriber | undefined;
     let polishCalls = 0;
     const server = createDaemon({
+      authToken: TEST_AUTH_TOKEN,
       apiKey: "test-only",
       port: 0,
       quiet: true,
@@ -154,7 +213,10 @@ describe("local daemon", () => {
 
     try {
       const events: ServerEvent[] = [];
-      const socket = new WebSocket(`ws://127.0.0.1:${server.port}/v1/transcribe`);
+      const socket = new WebSocket(
+        `ws://127.0.0.1:${server.port}/v1/transcribe`,
+        websocketAuthProtocol(TEST_AUTH_TOKEN),
+      );
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as ServerEvent;
         events.push(event);

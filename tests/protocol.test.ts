@@ -6,6 +6,7 @@ describe("local protocol", () => {
     expect(parseClientCommand('{"type":"stop"}')).toEqual({ type: "stop" });
     expect(normalizeConfig()).toEqual({
       mode: "smart",
+      polish: true,
       vad: "hybrid",
       languageCodes: [],
       customVocabulary: [],
@@ -27,6 +28,7 @@ describe("local protocol", () => {
     expect(() => parseClientCommand("nope")).toThrow("valid JSON");
     expect(() => parseClientCommand('{"type":"wat"}')).toThrow("Unknown command");
     expect(() => normalizeConfig({ mode: "other" as never })).toThrow("mode");
+    expect(() => normalizeConfig({ polish: "yes" as never })).toThrow("polish");
     expect(() => normalizeConfig({ languageCodes: ["not a code"] })).toThrow("BCP-47");
     expect(() => normalizeConfig({ vadPrefixPaddingMs: 2001 })).toThrow("2,000");
     expect(() => normalizeConfig({ vadSilenceDurationMs: 50 })).toThrow("5,000");

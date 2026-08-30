@@ -45,6 +45,7 @@ export function parseClientCommand(raw: string): ClientCommand {
 
 export function normalizeConfig(input?: Partial<TranscriptionConfig>): TranscriptionConfig {
   const mode = input?.mode ?? DEFAULT_TRANSCRIPTION_CONFIG.mode;
+  const polish = input?.polish ?? (mode !== "verbatim" && DEFAULT_TRANSCRIPTION_CONFIG.polish);
   const vad = input?.vad ?? DEFAULT_TRANSCRIPTION_CONFIG.vad;
   const languageCodes = input?.languageCodes ?? DEFAULT_TRANSCRIPTION_CONFIG.languageCodes;
   const customVocabulary = input?.customVocabulary ?? DEFAULT_TRANSCRIPTION_CONFIG.customVocabulary;
@@ -55,6 +56,9 @@ export function normalizeConfig(input?: Partial<TranscriptionConfig>): Transcrip
 
   if (mode !== "smart" && mode !== "verbatim") {
     throw new ProtocolError("invalid_mode", "mode must be smart or verbatim.");
+  }
+  if (typeof polish !== "boolean") {
+    throw new ProtocolError("invalid_polish", "polish must be a boolean.");
   }
   if (vad !== "automatic" && vad !== "hybrid" && vad !== "manual") {
     throw new ProtocolError("invalid_vad", "vad must be automatic, hybrid, or manual.");
@@ -97,6 +101,7 @@ export function normalizeConfig(input?: Partial<TranscriptionConfig>): Transcrip
 
   return {
     mode,
+    polish,
     vad,
     languageCodes: [...new Set(languageCodes)],
     customVocabulary: [...new Set(customVocabulary.map((term) => term.trim()))],

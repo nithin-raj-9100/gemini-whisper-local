@@ -1,6 +1,8 @@
 import { GeminiLiveTranscriber, type LiveTranscriber } from "./gemini-live.ts";
 import { createTranscriptIntelligence, type TranscriptIntelligence } from "./intelligence.ts";
+import { requestHasWebSocketToken, websocketAuthProtocol } from "./local-auth.ts";
 import { ProtocolError, normalizeConfig, parseClientCommand } from "./protocol.ts";
+import { SlidingWindowRateLimiter } from "./rate-limit.ts";
 import { AUDIO_CONTRACT, type ServerEvent, type TranscriptionConfig } from "./types.ts";
 
 const MAX_AUDIO_MESSAGE_BYTES = 1024 * 1024;
@@ -10,6 +12,7 @@ interface SocketData {
   session?: LiveTranscriber;
   finalSegments: string[];
   latestInterim: string;
+  polishEnabled: boolean;
   speculativePolish?: {
     input: string;
     startedBeforeFinal: boolean;
@@ -24,6 +27,7 @@ interface SocketData {
 }
 
 export interface DaemonOptions {
+  authToken: string;
   apiKey?: string;
   hostname?: string;
   port?: number;
@@ -38,7 +42,8 @@ export interface DaemonOptions {
   warmConfig?: TranscriptionConfig;
 }
 
-export function createDaemon(options: DaemonOptions = {}) {
+export function createDaemon(options: DaemonOptions) {
+  if (!options.authToken) throw new Error("A local authentication token is required.");
   const hostname = options.hostname ?? "127.0.0.1";
   const port = options.port ?? 8765;
   const apiKey = options.apiKey ?? Bun.env.GEMINI_API_KEY;
@@ -46,6 +51,7 @@ export function createDaemon(options: DaemonOptions = {}) {
     options.intelligence === false
       ? undefined
       : options.intelligence ?? (apiKey ? createTranscriptIntelligence({ apiKey }) : undefined);
+  const connectionRate = new SlidingWindowRateLimiter(30, 60_000);
   const createSession = (
     config: TranscriptionConfig,
     emit: (event: ServerEvent) => void,
@@ -95,12 +101,26 @@ export function createDaemon(options: DaemonOptions = {}) {
     fetch(request, bunServer) {
       const url = new URL(request.url);
       if (url.pathname !== "/v1/transcribe") return new Response("Not found", { status: 404 });
+      if (request.headers.has("origin")) {
+        return new Response("Browser WebSocket origins are not allowed", { status: 403 });
+      }
+      if (!requestHasWebSocketToken(request, options.authToken)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      if (!connectionRate.accept() || server.pendingWebSockets >= 4) {
+        return new Response("Too many local transcription sessions", {
+          status: 429,
+          headers: { "Retry-After": "2" },
+        });
+      }
       const upgraded = bunServer.upgrade(request, {
+        headers: { "Sec-WebSocket-Protocol": websocketAuthProtocol(options.authToken) },
         data: {
           id: crypto.randomUUID(),
           state: "idle",
           finalSegments: [],
           latestInterim: "",
+          polishEnabled: true,
         } satisfies SocketData,
       });
       return upgraded ? undefined : new Response("WebSocket upgrade failed", { status: 400 });
@@ -140,7 +160,7 @@ export function createDaemon(options: DaemonOptions = {}) {
               throw new ProtocolError("not_ready", "There is no ready transcription to stop.");
             }
             ws.data.state = "finishing";
-            if (options.speculativeIntelligence && intelligence) {
+            if (ws.data.polishEnabled && options.speculativeIntelligence && intelligence) {
               // Start cleanup from the latest hypothesis before asking Live to
               // finalize. This overlaps the two provider round trips. If Live
               // revises the text, startSpeculativePolish aborts and replaces
@@ -162,6 +182,7 @@ export function createDaemon(options: DaemonOptions = {}) {
           }
 
           const config = normalizeConfig(command.config);
+          ws.data.polishEnabled = config.polish;
           ws.data.state = "connecting";
           send(ws, { type: "connecting" });
 
@@ -172,16 +193,16 @@ export function createDaemon(options: DaemonOptions = {}) {
             if (event.type === "final") {
               ws.data.latestInterim = "";
               ws.data.finalSegments.push(event.text);
-              if (ws.data.state === "finishing" && intelligence) {
+              if (ws.data.polishEnabled && ws.data.state === "finishing" && intelligence) {
                 startSpeculativePolish(ws.data, intelligence, true);
               }
             }
             if (event.type === "complete") {
               if (ws.data.speculativeTimer) clearTimeout(ws.data.speculativeTimer);
-              if (options.speculativeIntelligence && intelligence) {
+              if (ws.data.polishEnabled && options.speculativeIntelligence && intelligence) {
                 startSpeculativePolish(ws.data, intelligence, true);
               }
-              void finishWithIntelligence(ws, intelligence);
+              void finishWithIntelligence(ws, ws.data.polishEnabled ? intelligence : undefined);
               return;
             }
             if (event.type === "cancelled" || event.type === "error") {

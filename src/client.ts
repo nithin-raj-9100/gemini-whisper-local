@@ -1,8 +1,10 @@
 import { PcmChunker } from "./audio.ts";
+import { websocketAuthProtocol } from "./local-auth.ts";
 import type { ServerEvent, TranscriptionConfig } from "./types.ts";
 
 export interface LocalClientOptions {
   url: string;
+  authToken: string;
   config: Partial<TranscriptionConfig>;
   onEvent?: (event: ServerEvent) => void;
 }
@@ -27,7 +29,7 @@ export class LocalTranscriptionClient {
       this.#readyReject = reject;
     });
     this.#complete = new Promise((resolve) => (this.#completeResolve = resolve));
-    const socket = new WebSocket(this.options.url);
+    const socket = new WebSocket(this.options.url, websocketAuthProtocol(this.options.authToken));
     this.#socket = socket;
     socket.binaryType = "arraybuffer";
 

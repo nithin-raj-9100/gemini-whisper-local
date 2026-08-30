@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { PCM_CHUNK_BYTES } from "../src/audio.ts";
+import { ensureLocalAuthToken, websocketAuthProtocol } from "../src/local-auth.ts";
 import type { ServerEvent, TranscriptionConfig } from "../src/types.ts";
 
 const audioPath = Bun.argv[2];
@@ -23,6 +24,7 @@ const config: Partial<TranscriptionConfig> = {
   vadPrefixPaddingMs: 300,
   vadSilenceDurationMs: 1000,
 };
+const authToken = await ensureLocalAuthToken();
 
 console.log(`Warming with ${Math.round(pcm.byteLength / 32) / 1000}s of audio…`);
 await runTrial(pcm, config);
@@ -74,7 +76,10 @@ async function runTrial(
   let polishMs = 0;
   let speculative = false;
   const warnings: string[] = [];
-  const socket = new WebSocket(`ws://${host}:${port}/v1/transcribe`);
+  const socket = new WebSocket(
+    `ws://${host}:${port}/v1/transcribe`,
+    websocketAuthProtocol(authToken),
+  );
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
     socket.send(JSON.stringify({ type: "start", config: transcriptionConfig }));

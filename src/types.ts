@@ -3,6 +3,7 @@ export type VadMode = "automatic" | "hybrid" | "manual";
 
 export interface TranscriptionConfig {
   mode: TranscriptionMode;
+  polish: boolean;
   languageCodes: string[];
   customVocabulary: string[];
   vad: VadMode;
@@ -47,6 +48,7 @@ export const AUDIO_CONTRACT: AudioContract = {
 
 export const DEFAULT_TRANSCRIPTION_CONFIG: TranscriptionConfig = {
   mode: "smart",
+  polish: true,
   languageCodes: [],
   customVocabulary: [],
   vad: "hybrid",

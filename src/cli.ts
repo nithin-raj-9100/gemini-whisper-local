@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { LocalTranscriptionClient } from "./client.ts";
 import { createDaemon } from "./server.ts";
+import { ensureLocalAuthToken } from "./local-auth.ts";
 import { TerminalPreview } from "./terminal-preview.ts";
 import type { ServerEvent, TranscriptionConfig } from "./types.ts";
 
@@ -21,13 +22,14 @@ const terminalPreview = new TerminalPreview(
 switch (command) {
   case "serve":
     createDaemon({
+      authToken: await ensureLocalAuthToken(),
       hostname: Bun.env.GEMINI_WHISPER_HOST,
       port: optionalNumber(Bun.env.GEMINI_WHISPER_PORT),
     });
     break;
   case "serve:sdk": {
     const { createSdkDaemon } = await import("./sdk-server.ts");
-    createSdkDaemon();
+    createSdkDaemon({ authToken: await ensureLocalAuthToken() });
     break;
   }
   case "mic":
@@ -291,6 +293,7 @@ async function connectClient(flags: Map<string, string | true>): Promise<LocalTr
     .filter(Boolean);
   const config: Partial<TranscriptionConfig> = {
     mode: flags.has("verbatim") ? "verbatim" : "smart",
+    polish: !flags.has("verbatim") && !flags.has("no-polish"),
     vad: flags.has("automatic-vad") ? "hybrid" : "manual",
     languageCodes: stringFlag(flags, "language") ? [stringFlag(flags, "language")!] : [],
     customVocabulary: vocabulary ?? [],
@@ -301,6 +304,7 @@ async function connectClient(flags: Map<string, string | true>): Promise<LocalTr
   let failed: Error | undefined;
   const client = new LocalTranscriptionClient({
     url: `ws://${host}:${port}/v1/transcribe`,
+    authToken: await ensureLocalAuthToken(),
     config,
     onEvent(event) {
       printEvent(event);
@@ -464,6 +468,7 @@ Options:
   --language <BCP-47>                   Hint a language, for example en-IN
   --vocabulary <term,term>              Bias domain-specific words
   --verbatim                            Preserve fillers and false starts
+  --no-polish                           Skip the Flash-Lite cleanup pass
   --manual-vad                          Use explicit activity boundaries (default)
   --automatic-vad                       Split turns automatically at pauses
   --prefix-padding-ms <0-2000>          Automatic-VAD speech onset padding (default 300)
