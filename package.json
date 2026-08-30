@@ -1,0 +1,23 @@
+{
+  "name": "gemini-whisper-local",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "serve": "bun run src/cli.ts serve",
+    "serve:sdk": "bun run src/cli.ts serve:sdk",
+    "system": "bun run src/system-service.ts",
+    "system:trigger": "bun run src/system-trigger.ts",
+    "system:audio:build": "mkdir -p macos/GeminiWhisperAudio.app/Contents/MacOS && cp macos/audio-helper/Info.plist macos/GeminiWhisperAudio.app/Contents/Info.plist && swiftc macos/audio-helper/main.swift -framework AVFoundation -o macos/GeminiWhisperAudio.app/Contents/MacOS/GeminiWhisperAudio && codesign --force --sign - macos/GeminiWhisperAudio.app",
+    "benchmark:latency": "bun run benchmarks/latency-bench.ts",
+    "mic": "bun run src/cli.ts mic",
+    "file": "bun run src/cli.ts file",
+    "devices": "bun run src/cli.ts devices",
+    "check": "bun build ./src/cli.ts --target bun --outdir ./dist",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage"
+  },
+  "dependencies": {
+    "@google/genai": "^2.19.0"
+  }
+}
