@@ -1,28 +1,28 @@
 # Installation instructions for an AI coding agent
 
-Install this project for the current macOS user. Do not ask the user to perform terminal steps.
-Only macOS privacy prompts and Apple's installer UI require the user's click.
+Install the native macOS Gemini Whisper app for the current user. Do not ask the user to perform
+terminal steps. Only macOS privacy prompts require the user's click.
 
 1. Confirm the machine is macOS and the checkout is trusted. Never print, transmit, or commit the
-   Gemini API key, `.env`, or `~/.config/gemini-whisper-local/auth-token`.
-2. Check `command -v bun`. If Bun is absent, ask permission to download it from the official
-   `https://bun.sh` installer, install it, and refresh `PATH`.
-3. Check `xcode-select -p`. If unavailable, run `xcode-select --install`, ask the user to approve
-   Apple's dialog, and wait until `swiftc` and `codesign` exist.
-4. Run `bun install --frozen-lockfile`. Preserve an existing `.env`; otherwise copy `.env.example`
-   to `.env`, set mode `0600`, and have the user enter `GEMINI_API_KEY` without echoing it or placing
-   it in command history.
-5. Run `bun test`, then `bun run install:macos`. The installer generates machine-specific
-   LaunchAgent configuration, creates a mode-`0600` local auth token, builds/signs the
-   AVAudioEngine helper with native Right Option event tap, and starts the service.
-6. Ask the user to allow `Gemini Whisper Audio` under Microphone and Bun / Gemini Whisper Audio
-   under Accessibility when macOS prompts. These permissions must never be bypassed.
-7. Run `bun run doctor:macos`. Finish only when all required checks pass and
-   `http://127.0.0.1:8766/health` reports healthy.
+   Gemini API key or `.env`. There is no auth token file in this design.
+2. Check `xcode-select -p`. If unavailable, run `xcode-select --install`, ask the user to approve
+   Apple's dialog, and wait until `swift` and `codesign` exist.
+3. Preserve an existing `.env`; otherwise copy `.env.example` to `.env`, set mode `0600`, and have
+   the user enter `GEMINI_API_KEY` without echoing it or placing it in command history.
+4. Unload any leftover Bun LaunchAgent (ignore errors if it is already gone):
+   `launchctl bootout "gui/$(id -u)/com.nithin.gemini-whisper"`
+5. From `macos/GeminiWhisper`, run `swift build`, then `./scripts/run-tests.sh`, then
+   `./scripts/build-app.sh`.
+6. Open the app with `open -g ../../macos/GeminiWhisper.app` (from the package directory) or
+   `open -g macos/GeminiWhisper.app` from the repo root.
+7. Ask the user to allow **Gemini Whisper** (`com.nithin.gemini-whisper`) under
+   **System Settings → Privacy & Security → Microphone** and **Accessibility** when macOS prompts.
+   These permissions must never be bypassed. Do not use Bun or “Gemini Whisper Audio”.
+8. Confirm `launchctl print "gui/$(id -u)/com.nithin.gemini-whisper"` fails (agent unloaded).
 
-`ffmpeg` is optional: do not install it for system-wide dictation. It is needed only for standalone
-`mic`, `file`, and `devices` commands. Clipboard insertion uses stock AppleScript and does not
-require `pbcopy` or `pbpaste`; the doctor reports those tools as optional when present.
+There is no LaunchAgent, localhost daemon, or ffmpeg requirement for dictation. The user starts
+dictation with Right Option after clicking a text field.
 
-To remove the installation, run `bun run uninstall:macos`. Add `--purge` only when the user also
-asks to delete the local authentication token.
+To stop using the app, quit Gemini Whisper from the menu-bar extra. Optionally delete
+`macos/GeminiWhisper.app` and `~/Library/LaunchAgents/com.nithin.gemini-whisper.plist` if a leftover
+Bun plist remains. Settings → **Remove legacy Bun service** does that bootout + plist delete.

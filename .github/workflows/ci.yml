@@ -9,15 +9,13 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: macos/GeminiWhisper
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.0
-      - run: bun install --frozen-lockfile
-      - run: bun test
-      - run: bun run check
+      - name: Build
+        run: swift build
+      - name: Test
+        run: ./scripts/run-tests.sh

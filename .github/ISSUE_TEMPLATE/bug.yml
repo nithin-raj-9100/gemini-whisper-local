@@ -5,7 +5,7 @@ labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Never include API keys, auth tokens, private transcripts, or sensitive audio.
+      value: Never include API keys, private transcripts, or sensitive audio.
   - type: input
     id: version
     attributes:
@@ -15,7 +15,7 @@ body:
   - type: input
     id: environment
     attributes:
-      label: macOS and Bun versions
+      label: macOS version and Xcode / Command Line Tools version
     validations:
       required: true
   - type: textarea
@@ -25,8 +25,8 @@ body:
     validations:
       required: true
   - type: textarea
-    id: doctor
+    id: permissions
     attributes:
-      label: Redacted `bun run doctor:macos` output
+      label: Microphone and Accessibility status for Gemini Whisper (not Bun)
     validations:
       required: true

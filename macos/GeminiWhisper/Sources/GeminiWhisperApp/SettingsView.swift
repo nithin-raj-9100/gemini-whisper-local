@@ -1,0 +1,210 @@
+import AVFoundation
+import SwiftUI
+
+struct SettingsView: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(DictationController.self) private var controller
+    @Environment(PermissionsMonitor.self) private var permissions
+
+    @State private var devices: [AudioDeviceList.Device] = []
+    @State private var legacyLoaded = false
+    @State private var legacyPlistExists = false
+    @State private var legacyStatus = ""
+    @State private var loginItemError = ""
+
+    var body: some View {
+        Form {
+            Section("Transcription") {
+                TextField("Language (BCP-47)", text: Bindable(settings).language)
+                TextField("Vocabulary (comma-separated)", text: Bindable(settings).vocabularyText, axis: .vertical)
+                    .lineLimit(2...4)
+                Picker("Mode", selection: Bindable(settings).mode) {
+                    ForEach(AppTranscriptionMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                Toggle("Polish with Flash-Lite", isOn: Bindable(settings).polish)
+                    .disabled(settings.mode == .verbatim)
+                Picker("VAD", selection: Bindable(settings).vad) {
+                    ForEach(AppVadMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                Text("Manual keeps pauses in one dictation (recommended for Right Option). Automatic and hybrid end a turn after the silence duration.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("VAD prefix padding (ms)", value: Bindable(settings).vadPrefixPaddingMs, format: .number)
+                TextField("VAD silence duration (ms)", value: Bindable(settings).vadSilenceDurationMs, format: .number)
+                Picker("Audio device", selection: Bindable(settings).audioDevice) {
+                    Text("System default").tag(AppSettings.systemDefaultDeviceID)
+                    ForEach(devices) { device in
+                        Text("\(device.name)\(device.isDefault ? " (default)" : "")")
+                            .tag(device.uniqueID)
+                    }
+                }
+            }
+
+            Section("Diagnostics") {
+                LabeledContent("Stop tail") {
+                    Text("\(settings.stopTailMs) ms")
+                }
+                LabeledContent("Environment file") {
+                    Text(settings.environment.envFileURL?.path ?? "not found")
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+                LabeledContent("API key") {
+                    Text(settings.environment.hasAPIKey ? "loaded" : "missing")
+                }
+                Button("Audio check (1s RMS / peak)") {
+                    Task { await controller.runAudioCheck() }
+                }
+                .disabled(controller.phase != .idle)
+                if let check = controller.lastAudioCheck {
+                    LabeledContent("Source") { Text(check.source) }
+                    LabeledContent("Bytes") { Text("\(check.bytes)") }
+                    LabeledContent("RMS") { Text("\(check.rms)") }
+                    LabeledContent("Peak") { Text("\(check.peak)") }
+                    if !check.error.isEmpty {
+                        Text(check.error)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+
+            Section("Permissions") {
+                LabeledContent("Microphone") {
+                    Text(permissions.microphoneGranted ? "granted" : permissions.microphoneStatus.label)
+                }
+                LabeledContent("Accessibility") {
+                    Text(permissions.accessibilityTrusted ? "trusted" : "not trusted")
+                }
+                LabeledContent("Keyboard event tap") {
+                    if permissions.eventTapInstalled {
+                        Text("installed")
+                    } else {
+                        Text("failed")
+                            .foregroundStyle(.orange)
+                    }
+                }
+                if !permissions.eventTapFailureMessage.isEmpty {
+                    Text(permissions.eventTapFailureMessage)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Paste") {
+                    Text(permissions.accessibilityTrusted ? "Cmd+V from this process" : "needs Accessibility")
+                }
+                LabeledContent("This process") {
+                    Text(PasteController.runningIdentity)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("App bundle") {
+                    Text(PasteController.bundleURL.path)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Paste log") {
+                    Text(AppLog.fileURL.path)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+                Button("Request microphone access") {
+                    Task { await permissions.requestMicrophone() }
+                }
+                Button("Prompt Accessibility") {
+                    permissions.promptAccessibility()
+                }
+                Button("Retry keyboard event tap") {
+                    HotkeyMonitor.shared.retryEventTap()
+                    permissions.refresh()
+                }
+                Button("Refresh permission status") {
+                    permissions.refresh()
+                }
+            }
+
+            Section("Legacy Bun service") {
+                LabeledContent("LaunchAgent") {
+                    Text(legacyLoaded ? "loaded — fights Right Option" : "not loaded")
+                        .foregroundStyle(legacyLoaded ? .orange : .primary)
+                }
+                LabeledContent("LaunchAgent plist") {
+                    Text(legacyPlistExists ? "present" : "absent")
+                }
+                Button("Remove legacy Bun service") {
+                    legacyStatus = LegacyServiceCleanup.removeCompletely()
+                    refreshLegacy()
+                }
+                if !legacyStatus.isEmpty {
+                    Text(legacyStatus)
+                        .textSelection(.enabled)
+                }
+                Toggle("Open Gemini Whisper at login", isOn: Bindable(settings).openAtLogin)
+                if !loginItemError.isEmpty {
+                    Text(loginItemError)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            Section("Last session") {
+                LabeledContent("State") { Text(controller.statusTitle) }
+                if !controller.lastTranscript.isEmpty {
+                    Text(controller.lastTranscript)
+                        .textSelection(.enabled)
+                }
+                if !controller.lastError.isEmpty {
+                    Text(controller.lastError)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(minWidth: 480, minHeight: 520)
+        .onAppear {
+            devices = AudioDeviceList.inputDevices()
+            permissions.refresh()
+            refreshLegacy()
+            settings.persist()
+        }
+        .onChange(of: settings.language) { _, _ in settings.persist() }
+        .onChange(of: settings.vocabularyText) { _, _ in settings.persist() }
+        .onChange(of: settings.mode) { _, _ in settings.persist() }
+        .onChange(of: settings.polish) { _, _ in settings.persist() }
+        .onChange(of: settings.vad) { _, _ in settings.persist() }
+        .onChange(of: settings.vadPrefixPaddingMs) { _, _ in settings.persist() }
+        .onChange(of: settings.vadSilenceDurationMs) { _, _ in settings.persist() }
+        .onChange(of: settings.audioDevice) { _, _ in
+            settings.persist()
+            controller.prepareCapture()
+        }
+        .onChange(of: settings.openAtLogin) { _, enabled in
+            settings.persist()
+            do {
+                try LegacyServiceCleanup.setOpenAtLogin(enabled)
+                loginItemError = ""
+            } catch {
+                loginItemError = error.localizedDescription
+            }
+        }
+    }
+
+    private func refreshLegacy() {
+        legacyLoaded = LegacyServiceCleanup.isLoaded()
+        legacyPlistExists = LegacyServiceCleanup.plistExists()
+    }
+}
+
+private extension AVAuthorizationStatus {
+    var label: String {
+        switch self {
+        case .authorized: return "granted"
+        case .denied: return "denied"
+        case .restricted: return "restricted"
+        case .notDetermined: return "not determined"
+        @unknown default: return "unknown"
+        }
+    }
+}
