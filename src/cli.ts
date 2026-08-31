@@ -152,6 +152,7 @@ async function transcribeMacAudioRelay(
     const inputReader = Bun.stdin.stream().getReader();
     await inputReader.read();
     inputReader.releaseLock();
+    await Bun.sleep(100);
     audioSocket.end();
     if (!client.closed) await client.finish();
     const clientError = client.error;

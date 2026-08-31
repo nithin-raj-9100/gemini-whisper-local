@@ -9,18 +9,15 @@ Only macOS privacy prompts and Apple's installer UI require the user's click.
    `https://bun.sh` installer, install it, and refresh `PATH`.
 3. Check `xcode-select -p`. If unavailable, run `xcode-select --install`, ask the user to approve
    Apple's dialog, and wait until `swiftc` and `codesign` exist.
-4. Check `/Applications/Karabiner-Elements.app`. If absent, ask permission to download the current
-   signed installer from `https://karabiner-elements.pqrs.org`, run it, and ask the user to approve
-   its macOS prompts. Do not assume Homebrew exists.
-5. Run `bun install --frozen-lockfile`. Preserve an existing `.env`; otherwise copy `.env.example`
+4. Run `bun install --frozen-lockfile`. Preserve an existing `.env`; otherwise copy `.env.example`
    to `.env`, set mode `0600`, and have the user enter `GEMINI_API_KEY` without echoing it or placing
    it in command history.
-6. Run `bun test`, then `bun run install:macos`. The installer generates machine-specific
-   LaunchAgent and Karabiner configuration, creates a mode-`0600` local auth token, builds/signs the
-   AVAudioEngine helper, and starts the service.
-7. Ask the user to allow `Gemini Whisper Audio` under Microphone and Bun under Accessibility when
-   macOS prompts. These permissions must never be bypassed.
-8. Run `bun run doctor:macos`. Finish only when all required checks pass and
+5. Run `bun test`, then `bun run install:macos`. The installer generates machine-specific
+   LaunchAgent configuration, creates a mode-`0600` local auth token, builds/signs the
+   AVAudioEngine helper with native Right Option event tap, and starts the service.
+6. Ask the user to allow `Gemini Whisper Audio` under Microphone and Bun / Gemini Whisper Audio
+   under Accessibility when macOS prompts. These permissions must never be bypassed.
+7. Run `bun run doctor:macos`. Finish only when all required checks pass and
    `http://127.0.0.1:8766/health` reports healthy.
 
 `ffmpeg` is optional: do not install it for system-wide dictation. It is needed only for standalone

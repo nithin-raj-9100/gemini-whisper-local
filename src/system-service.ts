@@ -32,9 +32,42 @@ let stopRequestedAtNs = 0;
 let targetApplication: Promise<string | undefined> | undefined;
 let audioHelperSocket: Bun.Socket<undefined> | undefined;
 let audioRelaySocket: Bun.Socket<undefined> | undefined;
+let controlSocket: Bun.Socket<undefined> | undefined;
 let audioHelperLaunching = false;
 let shuttingDown = false;
 let diagnosticAudio: Uint8Array[] | undefined;
+
+function sendAudioHelperCommand(command: string): void {
+  if (controlSocket) {
+    controlSocket.write(command);
+  } else if (audioHelperSocket) {
+    audioHelperSocket.write(command);
+  }
+}
+
+const controlReceiver = Bun.listen({
+  hostname,
+  port: 0,
+  socket: {
+    data(_socket, data) {
+      const message = new TextDecoder().decode(data);
+      if (message.includes("toggle")) {
+        toggleMicrophone();
+      }
+    },
+    open(socket) {
+      controlSocket?.end();
+      controlSocket = socket;
+      console.log(`Persistent macOS audio control connected on ${controlReceiver.port}.`);
+    },
+    close(socket) {
+      if (socket === controlSocket) controlSocket = undefined;
+    },
+    error(_socket, error) {
+      console.error(`Persistent macOS audio control failed: ${error.message}`);
+    },
+  },
+});
 
 const audioHelperReceiver = Bun.listen({
   hostname,
@@ -49,7 +82,7 @@ const audioHelperReceiver = Bun.listen({
       audioHelperSocket = socket;
       audioHelperLaunching = false;
       console.log(`Persistent macOS audio helper connected on ${audioHelperReceiver.port}.`);
-      if (audioRelaySocket && microphone && !stopping) socket.write("1");
+      if (audioRelaySocket && microphone && !stopping) sendAudioHelperCommand("1");
     },
     close(socket) {
       if (socket === audioHelperSocket) audioHelperSocket = undefined;
@@ -69,11 +102,11 @@ const audioRelayServer = Bun.listen({
     open(socket) {
       audioRelaySocket?.end();
       audioRelaySocket = socket;
-      if (audioHelperSocket && microphone && !stopping) audioHelperSocket.write("1");
+      if (audioHelperSocket && microphone && !stopping) sendAudioHelperCommand("1");
     },
     close(socket) {
       if (socket === audioRelaySocket) audioRelaySocket = undefined;
-      audioHelperSocket?.write("0");
+      sendAudioHelperCommand("0");
     },
     error(_socket, error) {
       console.error(`Local audio relay failed: ${error.message}`);
@@ -134,9 +167,16 @@ function toggleMicrophone(): { microphone: string } {
   stopRequestedAtNs = Bun.nanoseconds();
   console.log("Right Option: stopping and polishing dictation.");
   playSound("Pop");
-  audioHelperSocket?.write("0");
-  microphone.stdin.write("\n");
-  microphone.stdin.end();
+  // Keep audio capture running for 280ms so fast ending speech and final phonemes
+  // are fully captured from hardware buffers before finalization.
+  const activeMic = microphone;
+  setTimeout(() => {
+    sendAudioHelperCommand("0");
+    if (activeMic && activeMic === microphone) {
+      activeMic.stdin.write("\n");
+      activeMic.stdin.end();
+    }
+  }, 280);
   return { microphone: "finalizing" };
 }
 
@@ -261,9 +301,9 @@ async function checkBackgroundAudio(): Promise<{
       };
     }
     diagnosticAudio = [];
-    audioHelperSocket.write("1");
+    sendAudioHelperCommand("1");
     await Bun.sleep(1_000);
-    audioHelperSocket.write("0");
+    sendAudioHelperCommand("0");
     const chunks = diagnosticAudio;
     diagnosticAudio = undefined;
     const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
@@ -335,6 +375,8 @@ async function launchPersistentAudioHelper(): Promise<void> {
       "--args",
       "--port",
       String(audioHelperReceiver.port),
+      "--control-port",
+      String(controlReceiver.port),
       "--persistent",
     ],
     { stdin: "ignore", stdout: "ignore", stderr: "pipe" },
@@ -528,9 +570,11 @@ function optionalPort(value: string | undefined): number | undefined {
 function shutdown(): void {
   shuttingDown = true;
   microphone?.kill("SIGTERM");
-  audioHelperSocket?.write("q");
+  sendAudioHelperCommand("q");
   audioHelperSocket?.end();
   audioRelaySocket?.end();
+  controlSocket?.end();
+  controlReceiver.stop(true);
   audioHelperReceiver.stop(true);
   audioRelayServer.stop(true);
   hotkeyServer.stop(true);

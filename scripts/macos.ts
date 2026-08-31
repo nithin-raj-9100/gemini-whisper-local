@@ -16,8 +16,8 @@ const domain = `gui/${process.getuid?.() ?? 501}`;
 const launchAgentsDirectory = join(userHome, "Library", "LaunchAgents");
 const launchAgentPath = join(launchAgentsDirectory, `${label}.plist`);
 const helperApp = join(projectRoot, "macos", "GeminiWhisperAudio.app");
-const karabinerConfigPath = join(userHome, ".config", "karabiner", "karabiner.json");
-const karabinerAssetPath = join(
+const legacyKarabinerConfigPath = join(userHome, ".config", "karabiner", "karabiner.json");
+const legacyKarabinerAssetPath = join(
   userHome,
   ".config",
   "karabiner",
@@ -25,7 +25,6 @@ const karabinerAssetPath = join(
   "complex_modifications",
   "gemini-whisper.json",
 );
-const ruleDescription = "Right Option toggles Gemini Whisper system dictation";
 
 switch (command) {
   case "install":
@@ -56,7 +55,6 @@ async function install(): Promise<void> {
   if (dryRun) {
     console.log(`Would build the microphone helper in ${helperApp}`);
     console.log(`Would install ${launchAgentPath}`);
-    console.log(`Would configure Karabiner at ${karabinerConfigPath}`);
     console.log(`ffmpeg: ${Bun.which("ffmpeg") ? "available" : "not installed (optional)"}`);
     return;
   }
@@ -66,7 +64,7 @@ async function install(): Promise<void> {
   await mkdir(launchAgentsDirectory, { recursive: true, mode: 0o700 });
   await writeFile(launchAgentPath, launchAgentPlist(), { encoding: "utf8", mode: 0o600 });
   await chmod(launchAgentPath, 0o600);
-  await installKarabinerRule();
+  await cleanLegacyKarabinerRule();
 
   await runIgnoringFailure(["/bin/launchctl", "bootout", domain, launchAgentPath]);
   await run(["/bin/launchctl", "bootstrap", domain, launchAgentPath], "install the LaunchAgent");
@@ -85,14 +83,9 @@ async function install(): Promise<void> {
   ]);
 
   console.log("Installed Gemini Whisper system dictation.");
-  console.log("macOS may now request Microphone permission for Gemini Whisper Audio.");
-  console.log("Enable Accessibility for Bun when macOS requests permission to paste text.");
-  if (!(await karabinerInstalled())) {
-    console.log(
-      `Karabiner-Elements is not installed. The rule was prepared at ${karabinerAssetPath}; ` +
-        "install Karabiner-Elements, then enable the Gemini Whisper complex modification.",
-    );
-  }
+  console.log("Tap Right Option to toggle dictation.");
+  console.log("macOS may request Microphone permission for Gemini Whisper Audio.");
+  console.log("Enable Accessibility for Bun and Gemini Whisper Audio in System Settings > Privacy & Security.");
   if (!Bun.which("ffmpeg")) {
     console.log("ffmpeg is optional and is only needed for standalone mic/file/device commands.");
   }
@@ -102,7 +95,7 @@ async function install(): Promise<void> {
 async function uninstall(): Promise<void> {
   requireMacOS();
   await runIgnoringFailure(["/bin/launchctl", "bootout", domain, launchAgentPath]);
-  await removeKarabinerRule();
+  await cleanLegacyKarabinerRule();
   await rm(launchAgentPath, { force: true });
   await rm(helperApp, { recursive: true, force: true });
   if (Bun.argv.includes("--purge")) {
@@ -131,12 +124,6 @@ async function doctor(): Promise<void> {
     ok: Boolean(Bun.env.GEMINI_API_KEY),
     required: true,
     detail: Bun.env.GEMINI_API_KEY ? "configured" : "missing from the project .env",
-  });
-  checks.push({
-    name: "Karabiner-Elements",
-    ok: await karabinerInstalled(),
-    required: true,
-    detail: (await karabinerInstalled()) ? "installed" : "not installed",
   });
   checks.push({
     name: "microphone helper",
@@ -194,65 +181,35 @@ async function doctor(): Promise<void> {
   if (checks.some((check) => check.required && !check.ok)) process.exitCode = 1;
 }
 
-async function installKarabinerRule(): Promise<void> {
-  const rule = karabinerRule();
-  await mkdir(dirname(karabinerAssetPath), { recursive: true, mode: 0o700 });
-  await writeFile(
-    karabinerAssetPath,
-    `${JSON.stringify({ title: "Gemini Whisper", rules: [rule] }, null, 2)}\n`,
-    { encoding: "utf8", mode: 0o600 },
-  );
-  if (!(await Bun.file(karabinerConfigPath).exists())) return;
-
-  const config = JSON.parse(await readFile(karabinerConfigPath, "utf8")) as KarabinerConfig;
-  const profile = config.profiles?.find((candidate) => candidate.selected) ?? config.profiles?.[0];
-  if (!profile) return;
-  profile.complex_modifications ??= { rules: [] };
-  profile.complex_modifications.rules = profile.complex_modifications.rules.filter(
-    (candidate) => !isGeminiWhisperRule(candidate),
-  );
-  profile.complex_modifications.rules.unshift(rule);
-  await writeFile(karabinerConfigPath, `${JSON.stringify(config, null, 4)}\n`, "utf8");
-}
-
-async function removeKarabinerRule(): Promise<void> {
-  await rm(karabinerAssetPath, { force: true });
-  if (!(await Bun.file(karabinerConfigPath).exists())) return;
-  const config = JSON.parse(await readFile(karabinerConfigPath, "utf8")) as KarabinerConfig;
-  for (const profile of config.profiles ?? []) {
-    if (profile.complex_modifications) {
-      profile.complex_modifications.rules = profile.complex_modifications.rules.filter(
-        (candidate) => !isGeminiWhisperRule(candidate),
-      );
-    }
-  }
-  await writeFile(karabinerConfigPath, `${JSON.stringify(config, null, 4)}\n`, "utf8");
-}
-
-function karabinerRule(): KarabinerRule {
-  return {
-    description: ruleDescription,
-    manipulators: [
-      {
-        type: "basic",
-        from: { key_code: "right_option", modifiers: { optional: ["any"] } },
-        parameters: { "basic.to_if_alone_timeout_milliseconds": 500 },
-        to: [{ key_code: "right_option", lazy: true }],
-        to_if_alone: [
-          {
-            shell_command: `${shellQuote(process.execPath)} run ${shellQuote(join(projectRoot, "src", "system-trigger.ts"))}`,
+async function cleanLegacyKarabinerRule(): Promise<void> {
+  try {
+    await rm(legacyKarabinerAssetPath, { force: true });
+    if (!(await Bun.file(legacyKarabinerConfigPath).exists())) return;
+    const config = JSON.parse(await readFile(legacyKarabinerConfigPath, "utf8")) as {
+      profiles?: Array<{
+        complex_modifications?: {
+          rules: Array<{ description?: string; manipulators?: unknown[] }>;
+        };
+      }>;
+    };
+    for (const profile of config.profiles ?? []) {
+      if (profile.complex_modifications) {
+        profile.complex_modifications.rules = profile.complex_modifications.rules.filter(
+          (candidate) => {
+            const desc = (candidate.description ?? "").toLocaleLowerCase();
+            return (
+              !desc.includes("gemini-whisper") &&
+              !desc.includes("gemini whisper") &&
+              !JSON.stringify(candidate.manipulators).includes("gemini-whisper")
+            );
           },
-        ],
-      },
-    ],
-  };
-}
-
-function isGeminiWhisperRule(rule: KarabinerRule): boolean {
-  const description = rule.description.toLocaleLowerCase();
-  if (description.includes("right option toggles gemini-whisper system dictation")) return true;
-  if (description.includes("right option toggles gemini whisper system dictation")) return true;
-  return JSON.stringify(rule.manipulators).includes("gemini-whisper/src/system-trigger.ts");
+        );
+      }
+    }
+    await writeFile(legacyKarabinerConfigPath, `${JSON.stringify(config, null, 4)}\n`, "utf8");
+  } catch {
+    // Ignore legacy cleanup errors
+  }
 }
 
 function launchAgentPlist(): string {
@@ -271,20 +228,6 @@ function launchAgentPlist(): string {
 <key>StandardOutPath</key><string>${xml(join(logDirectory, "gemini-whisper.log"))}</string>
 <key>StandardErrorPath</key><string>${xml(join(logDirectory, "gemini-whisper.error.log"))}</string>
 </dict></plist>\n`;
-}
-
-async function karabinerInstalled(): Promise<boolean> {
-  for (const path of [
-    "/Applications/Karabiner-Elements.app",
-    join(userHome, "Applications", "Karabiner-Elements.app"),
-  ]) {
-    try {
-      if ((await stat(path)).isDirectory()) return true;
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-    }
-  }
-  return false;
 }
 
 async function run(command: string[], purpose: string): Promise<void> {
@@ -309,16 +252,4 @@ function shellQuote(value: string): string {
 
 function xml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-interface KarabinerRule {
-  description: string;
-  manipulators: Array<Record<string, unknown>>;
-}
-
-interface KarabinerConfig {
-  profiles?: Array<{
-    selected?: boolean;
-    complex_modifications?: { rules: KarabinerRule[] };
-  }>;
 }

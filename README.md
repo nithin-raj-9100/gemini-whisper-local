@@ -29,7 +29,7 @@ The daemon binds to `127.0.0.1` by default. The Gemini API key stays in the daem
 - Bun 1.4+
 - `ffmpeg` for the standalone `mic`, `file`, and `devices` commands
 - A Gemini API key with access to `gemini-3.5-transcribe-live`
-- macOS system mode: Xcode Command Line Tools and Karabiner-Elements
+- macOS system mode: Xcode Command Line Tools
 
 ## Install with an AI coding agent
 
@@ -72,8 +72,8 @@ The installed user LaunchAgent runs one Bun process containing both the localhos
 daemon and the right-Option controller. It keeps the signed AVAudioEngine capture helper warm while
 idle, eliminating microphone setup from the hot path. Gemini Live connects when dictation starts,
 while you are speaking, rather than occupying the provider's limited concurrent-session quota while
-idle. Karabiner-Elements maps a tap of right Option to the controller while preserving right Option
-as a modifier when it is held with another key.
+idle. The helper uses a native macOS event tap to detect when right Option is tapped alone, while
+preserving right Option as a modifier when it is held with another key.
 
 Click into a text field in Chrome, VS Code, Terminal, or another macOS application, then:
 
@@ -86,8 +86,7 @@ The service plays a short sound when capture starts, when finalization begins, a
 insertion, or when an error occurs. Right Option is therefore usable without opening a status UI.
 
 The agent-facing installer builds and ad-hoc signs the microphone helper, generates a protected
-local auth token, writes the LaunchAgent using the actual checkout and Bun paths, installs the
-Karabiner rule, and starts the service:
+local auth token, writes the LaunchAgent using the actual checkout and Bun paths, and starts the service:
 
 ```bash
 bun run install:macos
