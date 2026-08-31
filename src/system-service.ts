@@ -1,6 +1,7 @@
 import { createDaemon } from "./server.ts";
 import { ensureLocalAuthToken, requestHasBearerToken } from "./local-auth.ts";
 import { SlidingWindowRateLimiter } from "./rate-limit.ts";
+import { watchMachineOutput, type MachineResult } from "./system-output.ts";
 
 const projectRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const hostname = "127.0.0.1";
@@ -10,6 +11,9 @@ const audioHelperApp = `${projectRoot}/macos/GeminiWhisperAudio.app`;
 const systemLanguage = Bun.env.GEMINI_WHISPER_LANGUAGE ?? "en-IN";
 const authToken = await ensureLocalAuthToken();
 const controlRate = new SlidingWindowRateLimiter(20, 60_000);
+// Bounded pre-roll for audio captured between the right-Option tap and the mic
+// child connecting to the relay (~3s of PCM16 mono 16 kHz).
+const MAX_PRE_ROLL_BYTES = 16000 * 2 * 3;
 
 const transcriptionServer =
   transport === "sdk"
@@ -36,12 +40,15 @@ let controlSocket: Bun.Socket<undefined> | undefined;
 let audioHelperLaunching = false;
 let shuttingDown = false;
 let diagnosticAudio: Uint8Array[] | undefined;
+let preRollBuffer: Uint8Array[] = [];
+let preRollBytes = 0;
 
 function sendAudioHelperCommand(command: string): void {
+  const formatted = command.endsWith("\n") ? command : `${command}\n`;
   if (controlSocket) {
-    controlSocket.write(command);
+    controlSocket.write(formatted);
   } else if (audioHelperSocket) {
-    audioHelperSocket.write(command);
+    audioHelperSocket.write(formatted);
   }
 }
 
@@ -51,7 +58,9 @@ const controlReceiver = Bun.listen({
   socket: {
     data(_socket, data) {
       const message = new TextDecoder().decode(data);
-      if (message.includes("toggle")) {
+      if (message.includes("cancel")) {
+        cancelMicrophone();
+      } else if (message.includes("toggle")) {
         toggleMicrophone();
       }
     },
@@ -75,7 +84,15 @@ const audioHelperReceiver = Bun.listen({
   socket: {
     data(_socket, data) {
       if (diagnosticAudio) diagnosticAudio.push(data.slice());
-      audioRelaySocket?.write(data);
+      if (audioRelaySocket) {
+        audioRelaySocket.write(data);
+      } else if (microphone && !stopping) {
+        preRollBytes += data.byteLength;
+        preRollBuffer.push(data.slice());
+        while (preRollBytes > MAX_PRE_ROLL_BYTES && preRollBuffer.length > 0) {
+          preRollBytes -= preRollBuffer.shift()!.byteLength;
+        }
+      }
     },
     open(socket) {
       audioHelperSocket?.end();
@@ -102,6 +119,9 @@ const audioRelayServer = Bun.listen({
     open(socket) {
       audioRelaySocket?.end();
       audioRelaySocket = socket;
+      for (const chunk of preRollBuffer) socket.write(chunk);
+      preRollBuffer = [];
+      preRollBytes = 0;
       if (audioHelperSocket && microphone && !stopping) sendAudioHelperCommand("1");
     },
     close(socket) {
@@ -142,6 +162,9 @@ const hotkeyServer = Bun.serve({
     if (request.method === "POST" && url.pathname === "/toggle") {
       return Response.json(toggleMicrophone());
     }
+    if (request.method === "POST" && url.pathname === "/cancel") {
+      return Response.json(cancelMicrophone());
+    }
     if (url.pathname === "/permissions") {
       return Response.json({ pasteAutomation: await hasPasteAutomationPermission() });
     }
@@ -156,8 +179,38 @@ const hotkeyServer = Bun.serve({
 console.log(`System service ready: ${transport} transcription + right Option on ${hotkeyServer.port}.`);
 void launchPersistentAudioHelper();
 
+let cancelled = false;
+
+function cancelMicrophone(): { microphone: string } {
+  if (!microphone && !stopping) return { microphone: "idle" };
+  console.log("Dictation cancelled (Escape).");
+  cancelled = true;
+  stopping = false;
+  stopRequestedAtNs = 0;
+  sendAudioHelperCommand("0");
+  sendAudioHelperCommand("hud:hide");
+  if (microphone) {
+    const activeMic = microphone;
+    microphone = undefined;
+    activeMic.kill("SIGKILL");
+  }
+  targetApplication = undefined;
+  preRollBuffer = [];
+  preRollBytes = 0;
+  playSound("Pop");
+  return { microphone: "cancelled" };
+}
+
 function toggleMicrophone(): { microphone: string } {
   if (!microphone) {
+    preRollBuffer = [];
+    preRollBytes = 0;
+    // Warm the capture engine now so engine startup overlaps the mic child's
+    // spawn and Gemini connect. Audio captured before the child connects to the
+    // relay is buffered in preRollBuffer and flushed when it does.
+    sendAudioHelperCommand("1");
+    sendAudioHelperCommand("hud:show");
+    sendAudioHelperCommand("hud:state listening");
     startMicrophone();
     return { microphone: "starting" };
   }
@@ -165,10 +218,14 @@ function toggleMicrophone(): { microphone: string } {
 
   stopping = true;
   stopRequestedAtNs = Bun.nanoseconds();
+  preRollBuffer = [];
+  preRollBytes = 0;
   console.log("Right Option: stopping and polishing dictation.");
+  sendAudioHelperCommand("hud:state polishing");
   playSound("Pop");
-  // Keep audio capture running for 280ms so fast ending speech and final phonemes
-  // are fully captured from hardware buffers before finalization.
+  // Keep audio capture running for the tail window so fast ending speech and
+  // final phonemes are fully captured from hardware buffers before finalization.
+  const stopTailMs = Number(Bun.env.GEMINI_WHISPER_STOP_TAIL_MS ?? 400);
   const activeMic = microphone;
   setTimeout(() => {
     sendAudioHelperCommand("0");
@@ -176,7 +233,7 @@ function toggleMicrophone(): { microphone: string } {
       activeMic.stdin.write("\n");
       activeMic.stdin.end();
     }
-  }, 280);
+  }, stopTailMs);
   return { microphone: "finalizing" };
 }
 
@@ -190,7 +247,10 @@ function startMicrophone(): void {
   if (process.platform === "darwin") args.push("--audio-relay-port", String(audioRelayServer.port));
 
   console.log("Right Option: starting dictation.");
+  cancelled = false;
   targetApplication = frontmostApplication();
+  sendAudioHelperCommand("hud:show");
+  sendAudioHelperCommand("hud:state listening");
   microphone = Bun.spawn(args, {
     cwd: projectRoot,
     env: Bun.env,
@@ -200,12 +260,20 @@ function startMicrophone(): void {
   });
   playSound("Tink");
   const child = microphone;
-  const output = watchMachineOutput(child.stdout);
+  const output = watchMachineOutput(child.stdout, {
+    onInterim(text) {
+      if (!stopping && !cancelled) {
+        const b64 = Buffer.from(text, "utf8").toString("base64");
+        sendAudioHelperCommand(`hud:text ${b64}`);
+      }
+    },
+  });
   const stderr = new Response(child.stderr).text();
   let receivedResult = false;
 
   void output.result.then(async (result) => {
-    if (!result?.text) return;
+    sendAudioHelperCommand("hud:hide");
+    if (cancelled || !result?.text) return;
     receivedResult = true;
     // The transcript is complete. Do not make insertion wait for the one-shot
     // audio app and Launch Services process to finish cleaning themselves up.
@@ -228,11 +296,18 @@ function startMicrophone(): void {
   });
 
   void child.exited.then(async (exitCode) => {
+    sendAudioHelperCommand("hud:hide");
     const [, errors] = await Promise.all([output.done, stderr]);
     microphone = undefined;
     stopping = false;
     targetApplication = undefined;
+    preRollBuffer = [];
+    preRollBytes = 0;
 
+    if (cancelled) {
+      cancelled = false;
+      return;
+    }
     if (errors.trim()) console.error(errors.trim());
     if (exitCode !== 0 && !receivedResult) {
       playSound("Basso");
@@ -247,6 +322,8 @@ function startMicrophone(): void {
     }
   });
 }
+
+
 
 function notifyDictationFailure(detail: string): void {
   const message = detail.includes("exceeded your current quota")
@@ -414,76 +491,7 @@ function playSound(name: "Tink" | "Pop" | "Glass" | "Basso"): void {
   void sound.exited;
 }
 
-type MachineResult = {
-  text: string;
-  polished: boolean;
-  polishLatencyMs: number;
-  speculative: boolean;
-};
 
-function watchMachineOutput(stream: ReadableStream<Uint8Array>): {
-  result: Promise<MachineResult | undefined>;
-  done: Promise<void>;
-} {
-  let resolveResult!: (result: MachineResult | undefined) => void;
-  let resolved = false;
-  const result = new Promise<MachineResult | undefined>((resolve) => (resolveResult = resolve));
-  const done = (async () => {
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    let pending = "";
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        pending += decoder.decode(value, { stream: !done });
-        const lines = pending.split("\n");
-        pending = lines.pop() ?? "";
-        for (const line of lines) {
-          const parsed = parseMachineResult(line);
-          if (parsed && !resolved) {
-            resolved = true;
-            resolveResult(parsed);
-          }
-        }
-        if (done) break;
-      }
-      const parsed = parseMachineResult(pending);
-      if (parsed && !resolved) {
-        resolved = true;
-        resolveResult(parsed);
-      }
-    } finally {
-      reader.releaseLock();
-      if (!resolved) resolveResult(undefined);
-    }
-  })();
-  return { result, done };
-}
-
-function parseMachineResult(
-  output: string,
-): MachineResult | undefined {
-  const line = output.trim().split("\n").at(-1);
-  if (!line) return undefined;
-  try {
-    const value = JSON.parse(line) as {
-      text?: unknown;
-      polished?: unknown;
-      polishLatencyMs?: unknown;
-      speculative?: unknown;
-    };
-    if (typeof value.text !== "string") return undefined;
-    return {
-      text: value.text,
-      polished: value.polished === true,
-      polishLatencyMs:
-        typeof value.polishLatencyMs === "number" ? Math.round(value.polishLatencyMs) : 0,
-      speculative: value.speculative === true,
-    };
-  } catch {
-    return undefined;
-  }
-}
 
 async function pasteIntoFocusedApplication(
   text: string,

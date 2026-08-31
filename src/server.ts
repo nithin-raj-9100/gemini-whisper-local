@@ -328,7 +328,7 @@ async function finishWithIntelligence(
 ): Promise<void> {
   if (ws.data.state === "closed") return;
   ws.data.state = "finishing";
-  const transcript = ws.data.finalSegments.join("\n").trim();
+  const transcript = transcriptDraft(ws.data);
 
   if (intelligence && transcript) {
     try {

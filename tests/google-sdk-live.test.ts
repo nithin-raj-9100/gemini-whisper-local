@@ -28,8 +28,8 @@ describe("Google SDK variant", () => {
           disabled: false,
           startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
           endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-          prefixPaddingMs: 300,
-          silenceDurationMs: 1000,
+          prefixPaddingMs: 500,
+          silenceDurationMs: 1500,
         },
       },
     });
@@ -113,6 +113,8 @@ describe("Google SDK variant", () => {
 
     await transcriber.connect();
     transcriber.sendAudio(new Uint8Array([1, 0]));
+    // Let the pause Gemini needs to auto-complete the turn elapse first.
+    await Bun.sleep(900);
     parameters!.callbacks.onmessage({
       serverContent: { inputTranscription: { text: "Already final." }, turnComplete: true },
     });
@@ -147,6 +149,7 @@ describe("Google SDK variant", () => {
 
     await transcriber.connect();
     transcriber.sendAudio(new Uint8Array([1, 0]));
+    await Bun.sleep(900);
     parameters!.callbacks.onmessage({
       serverContent: {
         interimInputTranscription: { text: "Buffered SDK words" },
@@ -156,6 +159,41 @@ describe("Google SDK variant", () => {
     transcriber.finish();
 
     expect(events).toContainEqual({ type: "final", text: "Buffered SDK words" });
+    expect(events.at(-1)?.type).toBe("complete");
+  });
+
+  test("does not skip SDK finalization when a late turn complete races with recent audio", async () => {
+    const sent: unknown[] = [];
+    let parameters: LiveConnectParameters | undefined;
+    const fakeSession = {
+      sendRealtimeInput(value: unknown) {
+        sent.push(value);
+      },
+      close() {},
+    } as unknown as Session;
+    const events: Array<{ type: string; text?: string }> = [];
+    const transcriber = new GoogleSdkLiveTranscriber({
+      apiKey: "test-only",
+      config: DEFAULT_TRANSCRIPTION_CONFIG,
+      emit: (event) => events.push(event),
+      async connectSession(value) {
+        parameters = value;
+        return fakeSession;
+      },
+    });
+
+    await transcriber.connect();
+    transcriber.sendAudio(new Uint8Array([1, 0]));
+    parameters!.callbacks.onmessage({ serverContent: { turnComplete: true } });
+    transcriber.finish();
+
+    expect(sent[sent.length - 1]).toEqual({ audioStreamEnd: true });
+    expect(events.some((event) => event.type === "complete")).toBe(false);
+
+    parameters!.callbacks.onmessage({
+      serverContent: { inputTranscription: { text: "Resumed speech." }, turnComplete: true },
+    });
+    expect(events).toContainEqual({ type: "final", text: "Resumed speech." });
     expect(events.at(-1)?.type).toBe("complete");
   });
 });

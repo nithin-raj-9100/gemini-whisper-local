@@ -5,10 +5,14 @@ const GEMINI_ENDPOINT =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 const MODEL = "models/gemini-3.5-transcribe-live";
 const CONNECT_TIMEOUT_MS = 15_000;
-const FAST_FINISH_GRACE_MS = 400;
-const HARD_FINISH_TIMEOUT_MS = 6_000;
+const FAST_FINISH_GRACE_MS = 1_200;
+const HARD_FINISH_TIMEOUT_MS = 3_500;
 const SESSION_TIMEOUT_MS = 9 * 60 * 1000;
 const MAX_BUFFERED_AUDIO_BYTES = 16000 * 2 * 10;
+// A turnComplete only proves the turns Gemini had already observed were
+// finalized. If it arrives within RACE_WINDOW_MS of the last audio, a resumed
+// turn may still be in flight, so finish() must not skip audioStreamEnd.
+const RACE_WINDOW_MS = 800;
 const MAX_RECONNECT_ATTEMPTS = 2;
 const RECONNECT_DELAY_MS = 200;
 
@@ -90,7 +94,8 @@ export class GeminiLiveTranscriber implements LiveTranscriber {
   #failureReported = false;
   #reconnectAttempts = 0;
   #finishRequested = false;
-  #audioSinceTurnComplete = false;
+  #lastAudioSentAt = 0;
+  #lastTurnCompleteAt = 0;
   #latestInterim = "";
   #lastFinal = "";
   #hasTranscript = false;
@@ -122,7 +127,7 @@ export class GeminiLiveTranscriber implements LiveTranscriber {
       this.#queuedBytes += chunk.byteLength;
       return;
     }
-    this.#audioSinceTurnComplete = true;
+    this.#lastAudioSentAt = performance.now();
     this.#sendAudio(chunk);
   }
 
@@ -134,7 +139,11 @@ export class GeminiLiveTranscriber implements LiveTranscriber {
     if (this.#state !== "ready") throw new Error("The transcription session is not ready.");
     this.#state = "finishing";
     this.options.emit({ type: "speech-end" });
-    if (this.options.config.vad !== "manual" && !this.#audioSinceTurnComplete) {
+    if (
+      this.options.config.vad !== "manual" &&
+      (this.#lastAudioSentAt === 0 ||
+        this.#lastTurnCompleteAt - this.#lastAudioSentAt > RACE_WINDOW_MS)
+    ) {
       this.options.emit({ type: "complete" });
       this.close();
       return;
@@ -234,6 +243,18 @@ export class GeminiLiveTranscriber implements LiveTranscriber {
 
       this.#state = "closed";
       if (!wasExpected && !this.#failureReported) {
+        const recovered = this.#commitInterimFallback();
+        if (this.#hasTranscript || recovered) {
+          const reason = sanitizeCloseReason(event.reason);
+          const detail = reason ? `: ${reason}` : "";
+          this.options.emit({
+            type: "warning",
+            code: "gemini_connection_closed",
+            message: `Gemini Live closed the session (code ${event.code})${detail}; using buffered transcript.`,
+          });
+          this.options.emit({ type: "complete" });
+          return;
+        }
         const reason = sanitizeCloseReason(event.reason);
         const detail = reason ? `: ${reason}` : "";
         this.#fail(
@@ -262,7 +283,7 @@ export class GeminiLiveTranscriber implements LiveTranscriber {
           }
           if (event.type === "complete") {
             this.#commitInterimFallback();
-            this.#audioSinceTurnComplete = false;
+            this.#lastTurnCompleteAt = performance.now();
             // Gemini completes a turn whenever automatic VAD observes a natural
             // pause. A dictation may contain many such turns, so only expose
             // session completion after the local client explicitly called finish().
@@ -316,7 +337,7 @@ export class GeminiLiveTranscriber implements LiveTranscriber {
 
     if (this.options.config.vad === "manual") this.#send({ realtimeInput: { activityStart: {} } });
     for (const chunk of this.#queuedAudio) this.#sendAudio(chunk);
-    if (this.#queuedAudio.length > 0) this.#audioSinceTurnComplete = true;
+    if (this.#queuedAudio.length > 0) this.#lastAudioSentAt = performance.now();
     this.#queuedAudio = [];
     this.#queuedBytes = 0;
 

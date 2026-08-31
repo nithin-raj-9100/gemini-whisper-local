@@ -15,6 +15,10 @@ import type { ServerEvent, TranscriptionConfig } from "./types.ts";
 
 const MODEL = "gemini-3.5-transcribe-live";
 const MAX_BUFFERED_AUDIO_BYTES = 16000 * 2 * 10;
+// A turnComplete only proves the turns Gemini had already observed were
+// finalized. If it arrives within RACE_WINDOW_MS of the last audio, a resumed
+// turn may still be in flight, so finish() must not skip audioStreamEnd.
+const RACE_WINDOW_MS = 800;
 const MAX_RECONNECT_ATTEMPTS = 2;
 const RECONNECT_DELAY_MS = 200;
 const FINISH_TIMEOUT_MS = 2_500;
@@ -80,7 +84,8 @@ export class GoogleSdkLiveTranscriber implements LiveTranscriber {
   #sessionTimer?: Timer;
   #connectResolve?: () => void;
   #connectReject?: (error: Error) => void;
-  #audioSinceTurnComplete = false;
+  #lastAudioSentAt = 0;
+  #lastTurnCompleteAt = 0;
   #latestInterim = "";
   #lastFinal = "";
   #hasTranscript = false;
@@ -111,7 +116,7 @@ export class GoogleSdkLiveTranscriber implements LiveTranscriber {
       this.#queuedBytes += chunk.byteLength;
       return;
     }
-    this.#audioSinceTurnComplete = true;
+    this.#lastAudioSentAt = performance.now();
     this.#sendAudio(chunk);
   }
 
@@ -125,7 +130,11 @@ export class GoogleSdkLiveTranscriber implements LiveTranscriber {
     }
     this.#state = "finishing";
     this.options.emit({ type: "speech-end" });
-    if (this.options.config.vad !== "manual" && !this.#audioSinceTurnComplete) {
+    if (
+      this.options.config.vad !== "manual" &&
+      (this.#lastAudioSentAt === 0 ||
+        this.#lastTurnCompleteAt - this.#lastAudioSentAt > RACE_WINDOW_MS)
+    ) {
       this.options.emit({ type: "complete" });
       this.close();
       return;
@@ -212,7 +221,7 @@ export class GoogleSdkLiveTranscriber implements LiveTranscriber {
       }
       this.options.emit({ type: "speech-start" });
       for (const chunk of this.#queuedAudio) this.#sendAudio(chunk);
-      if (this.#queuedAudio.length > 0) this.#audioSinceTurnComplete = true;
+      if (this.#queuedAudio.length > 0) this.#lastAudioSentAt = performance.now();
       this.#queuedAudio = [];
       this.#queuedBytes = 0;
 
@@ -235,7 +244,7 @@ export class GoogleSdkLiveTranscriber implements LiveTranscriber {
     for (const event of sdkMessageToEvents(message)) {
       if (event.type === "complete") {
         this.#commitInterimFallback();
-        this.#audioSinceTurnComplete = false;
+        this.#lastTurnCompleteAt = performance.now();
         if (this.#state === "finishing") {
           this.options.emit(event);
           this.close();
@@ -292,6 +301,16 @@ export class GoogleSdkLiveTranscriber implements LiveTranscriber {
     }
 
     this.#state = "closed";
+    const recovered = this.#commitInterimFallback();
+    if (this.#hasTranscript || recovered) {
+      this.options.emit({
+        type: "warning",
+        code: "gemini_sdk_connection_closed",
+        message: `${message}; using buffered transcript.`,
+      });
+      this.options.emit({ type: "complete" });
+      return;
+    }
     this.#fail("gemini_sdk_connection_closed", message, true);
   }
 

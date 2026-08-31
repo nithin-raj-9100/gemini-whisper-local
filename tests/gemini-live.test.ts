@@ -28,8 +28,8 @@ describe("Gemini wire protocol", () => {
             disabled: false,
             startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
             endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
-            prefixPaddingMs: 300,
-            silenceDurationMs: 1000,
+            prefixPaddingMs: 500,
+            silenceDurationMs: 1500,
           },
         },
       },
@@ -120,6 +120,9 @@ describe("Gemini wire protocol", () => {
     await connected;
     await Bun.sleep(0);
     transcriber.sendAudio(new Uint8Array([1, 0]));
+    // Gemini only completes a turn after observing silenceDurationMs of quiet,
+    // so let that pause elapse before the complete provably finalizes the audio.
+    await Bun.sleep(900);
     socket.message({
       serverContent: { inputTranscription: { text: "Already final." }, turnComplete: true },
     });
@@ -154,6 +157,7 @@ describe("Gemini wire protocol", () => {
     await connected;
     await Bun.sleep(0);
     transcriber.sendAudio(new Uint8Array([1, 0]));
+    await Bun.sleep(900);
     socket.message({
       serverContent: { interimInputTranscription: { text: "Buffered words" }, turnComplete: true },
     });
@@ -161,6 +165,41 @@ describe("Gemini wire protocol", () => {
     transcriber.finish();
 
     expect(events).toContainEqual({ type: "final", text: "Buffered words" });
+    expect(events.at(-1)?.type).toBe("complete");
+  });
+
+  test("does not skip finalization when a late turn complete races with recent audio", async () => {
+    const socket = new FakeWebSocket();
+    const events: Array<{ type: string; text?: string }> = [];
+    const transcriber = new GeminiLiveTranscriber({
+      apiKey: "test-only",
+      config: DEFAULT_TRANSCRIPTION_CONFIG,
+      emit: (event) => events.push(event),
+      webSocketFactory: () => socket as unknown as WebSocket,
+    });
+
+    const connected = transcriber.connect();
+    socket.open();
+    socket.message({ setupComplete: {} });
+    await connected;
+    await Bun.sleep(0);
+    // Resumed speech after a mid-dictation pause, with Gemini's turnComplete
+    // for the paused turn still arriving afterwards.
+    transcriber.sendAudio(new Uint8Array([1, 0]));
+    socket.message({ serverContent: { turnComplete: true } });
+    await Bun.sleep(0);
+    transcriber.finish();
+
+    expect(JSON.parse(socket.sent[socket.sent.length - 1]!)).toEqual({
+      realtimeInput: { audioStreamEnd: true },
+    });
+    expect(events.some((event) => event.type === "complete")).toBe(false);
+
+    socket.message({
+      serverContent: { inputTranscription: { text: "Resumed speech." }, turnComplete: true },
+    });
+    await Bun.sleep(0);
+    expect(events).toContainEqual({ type: "final", text: "Resumed speech." });
     expect(events.at(-1)?.type).toBe("complete");
   });
 

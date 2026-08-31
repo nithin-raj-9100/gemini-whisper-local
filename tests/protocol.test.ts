@@ -10,8 +10,8 @@ describe("local protocol", () => {
       vad: "hybrid",
       languageCodes: [],
       customVocabulary: [],
-      vadPrefixPaddingMs: 300,
-      vadSilenceDurationMs: 1000,
+      vadPrefixPaddingMs: 500,
+      vadSilenceDurationMs: 1500,
     });
   });
 

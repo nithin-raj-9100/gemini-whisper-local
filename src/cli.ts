@@ -5,6 +5,9 @@ import { ensureLocalAuthToken } from "./local-auth.ts";
 import { TerminalPreview } from "./terminal-preview.ts";
 import type { ServerEvent, TranscriptionConfig } from "./types.ts";
 
+// Bounded buffer for audio captured before the local daemon and Gemini are ready.
+const MAX_QUEUED_AUDIO_BYTES = 16000 * 2 * 10;
+
 const command = Bun.argv[2] ?? "help";
 const flags = parseFlags(Bun.argv.slice(3));
 const systemMode = flags.has("system");
@@ -100,7 +103,10 @@ async function transcribeMicrophone(flags: Map<string, string | true>): Promise<
   if (stoppedBy === "user" && !client.closed) await client.finish();
   const clientError = client.error;
   client.close();
-  if (clientError) throw clientError;
+  if (clientError) {
+    if (!capturedPolished && capturedFinals.length === 0) throw clientError;
+    console.error(`Warning: ${clientError.message}; using captured transcript.`);
+  }
   if (systemMode) {
     const text = capturedPolished || capturedFinals.join("\n").trim();
     console.log(
@@ -120,6 +126,7 @@ async function transcribeMacAudioRelay(
 ): Promise<void> {
   const metrics = { bytes: 0, samples: 0, sumSquares: 0, peak: 0 };
   const queued: Uint8Array[] = [];
+  let queuedBytes = 0;
   let client: LocalTranscriptionClient | undefined;
   const clientPromise = connectClient(flags);
   const audioSocket = await Bun.connect({
@@ -129,7 +136,10 @@ async function transcribeMacAudioRelay(
       data(_socket, data) {
         updateAudioMetrics(metrics, data);
         if (client) client.sendAudio(data);
-        else queued.push(data.slice());
+        else if (queuedBytes < MAX_QUEUED_AUDIO_BYTES) {
+          queued.push(data.slice());
+          queuedBytes += data.byteLength;
+        }
       },
       open() {},
       close() {},
@@ -148,16 +158,22 @@ async function transcribeMacAudioRelay(
       if (!client.sendAudio(chunk)) break;
     }
     queued.length = 0;
+    queuedBytes = 0;
 
     const inputReader = Bun.stdin.stream().getReader();
     await inputReader.read();
     inputReader.releaseLock();
-    await Bun.sleep(100);
+    // Drain in-flight audio from the relay before finalizing so the final
+    // phonemes reach Gemini. Tunable via GEMINI_WHISPER_DRAIN_MS.
+    await Bun.sleep(Number(Bun.env.GEMINI_WHISPER_DRAIN_MS ?? 400));
     audioSocket.end();
     if (!client.closed) await client.finish();
     const clientError = client.error;
     client.close();
-    if (clientError) throw clientError;
+    if (clientError) {
+      if (!capturedPolished && capturedFinals.length === 0) throw clientError;
+      console.error(`Warning: ${clientError.message}; using captured transcript.`);
+    }
 
     if (systemMode) {
       const rms = metrics.samples > 0 ? Math.round(Math.sqrt(metrics.sumSquares / metrics.samples)) : 0;
@@ -298,8 +314,8 @@ async function connectClient(flags: Map<string, string | true>): Promise<LocalTr
     vad: flags.has("automatic-vad") ? "hybrid" : "manual",
     languageCodes: stringFlag(flags, "language") ? [stringFlag(flags, "language")!] : [],
     customVocabulary: vocabulary ?? [],
-    vadPrefixPaddingMs: numberFlag(flags, "prefix-padding-ms") ?? 300,
-    vadSilenceDurationMs: numberFlag(flags, "silence-ms") ?? 1000,
+    vadPrefixPaddingMs: numberFlag(flags, "prefix-padding-ms") ?? 500,
+    vadSilenceDurationMs: numberFlag(flags, "silence-ms") ?? 1500,
   };
 
   let failed: Error | undefined;
@@ -358,14 +374,23 @@ function updateAudioMetrics(
 
 function printEvent(event: ServerEvent): void {
   if (systemMode) {
-    if (event.type === "final") capturedFinals.push(event.text);
-    if (event.type === "polished") {
+    if (event.type === "interim") {
+      const cumulative = [...capturedFinals, event.text].filter(Boolean).join(" ").trim();
+      console.log(JSON.stringify({ type: "interim", text: cumulative }));
+    } else if (event.type === "final") {
+      capturedFinals.push(event.text);
+      const cumulative = capturedFinals.filter(Boolean).join(" ").trim();
+      console.log(JSON.stringify({ type: "final", text: cumulative }));
+    } else if (event.type === "polished") {
       capturedPolished = event.text;
       capturedPolishLatencyMs = event.latencyMs;
       capturedSpeculativePolish = event.speculative === true;
+      console.log(JSON.stringify({ type: "polished", text: event.text }));
+    } else if (event.type === "warning") {
+      console.error(`${event.code}: ${event.message}`);
+    } else if (event.type === "error") {
+      console.error(`${event.code}: ${event.message}`);
     }
-    if (event.type === "warning") console.error(`${event.code}: ${event.message}`);
-    if (event.type === "error") console.error(`${event.code}: ${event.message}`);
     return;
   }
   switch (event.type) {

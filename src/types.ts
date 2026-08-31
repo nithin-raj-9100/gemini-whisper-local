@@ -52,6 +52,6 @@ export const DEFAULT_TRANSCRIPTION_CONFIG: TranscriptionConfig = {
   languageCodes: [],
   customVocabulary: [],
   vad: "hybrid",
-  vadPrefixPaddingMs: 300,
-  vadSilenceDurationMs: 1000,
+  vadPrefixPaddingMs: 500,
+  vadSilenceDurationMs: 1500,
 };
