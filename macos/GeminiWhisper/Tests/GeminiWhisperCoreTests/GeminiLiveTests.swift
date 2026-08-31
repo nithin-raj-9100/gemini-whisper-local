@@ -7,14 +7,14 @@ struct GeminiLiveTests {
     @Test func buildsASmartTranscriptionSetup() {
         var config = TranscriptionConfig.default
         config.languageCodes = ["en-IN"]
-        config.customVocabulary = ["Bun"]
+        config.customVocabulary = ["Codex"]
         let expected: [String: Any] = [
             "setup": [
                 "model": "models/gemini-3.5-transcribe-live",
                 "generationConfig": ["responseModalities": ["TEXT"]],
                 "inputAudioTranscription": [
                     "languageCodes": ["en-IN"],
-                    "customVocabulary": ["Bun"],
+                    "customVocabulary": ["Codex"],
                     "mode": "SMART",
                 ],
                 "realtimeInputConfig": [
@@ -66,6 +66,44 @@ struct GeminiLiveTests {
                 return false
             }
         )
+    }
+
+    @Test func preservesPriorTextWhenGeminiStartsANewInterimWindow() {
+        var accumulator = InterimTranscriptAccumulator()
+        _ = accumulator.accept("No, this is not what I meant.")
+        let first = accumulator.accept(
+            "No, this is not what I meant. As seen in the attached image, when I speak some part"
+        )
+        #expect(first == "No, this is not what I meant. As seen in the attached image, when I speak some part")
+
+        let reset = accumulator.accept("after this You can see that it")
+        #expect(reset == first + " after this You can see that it")
+
+        let expanded = accumulator.accept(
+            "after this You can see that it no longer shows the earlier transcript"
+        )
+        #expect(expanded == first + " after this You can see that it no longer shows the earlier transcript")
+    }
+
+    @Test func allowsARewrittenInterimHypothesisToReplaceSimilarSizedText() {
+        var accumulator = InterimTranscriptAccumulator()
+        _ = accumulator.accept("The model should tell me what went correctly today")
+        #expect(accumulator.accept("The model should tell the team what went wrong today")
+            == "The model should tell the team what went wrong today")
+    }
+
+    @Test func slidingInterimRevisionsDoNotFabricateRepeatedParagraphs() {
+        var accumulator = InterimTranscriptAccumulator()
+        _ = accumulator.accept("My app targets developers and should make prompts shorter")
+        _ = accumulator.accept("making prompts shorter for example oh my god should become OMG")
+        let result = accumulator.accept(
+            "for example oh my god should become OMG and numeric quantities should use digits"
+        )
+
+        #expect(result == "My app targets developers and should make prompts shorter "
+            + "making prompts shorter for example oh my god should become OMG "
+            + "and numeric quantities should use digits")
+        #expect(result.components(separatedBy: "oh my god should become OMG").count == 2)
     }
 
     @Test func keepsSessionOpenThroughMidUtteranceTurnCompleteAndPauseAudio() async throws {
@@ -260,6 +298,48 @@ struct GeminiLiveTests {
         let realtime = audio["realtimeInput"] as! [String: Any]
         let payload = realtime["audio"] as! [String: Any]
         #expect(payload["data"] as? String == "AwA=")
+        transcriber.close()
+    }
+
+    @Test func reconnectsWhenTransportIsClosingBeforeCloseCallback() async throws {
+        let sockets = SocketList()
+        var eventTypes: [String] = []
+        let transcriber = GeminiLiveTranscriber(
+            apiKey: "test-only",
+            config: .default,
+            emit: { eventTypes.append($0.typeName) },
+            webSocketFactory: { _ in
+                let socket = FakeWebSocket()
+                sockets.append(socket)
+                return socket
+            }
+        )
+
+        async let connected: Void = transcriber.connect()
+        for _ in 0..<50 where sockets.count == 0 {
+            await Task.yield()
+        }
+        sockets[0].simulateOpen()
+        sockets[0].simulateJSON(["setupComplete": [String: Any]()])
+        try await connected
+        await Task.yield()
+
+        // Reproduce URLSession's failure window: its wrapper has stopped being
+        // open, but the transcriber has not received a close callback yet.
+        sockets[0].readyState = .closing
+        try transcriber.sendAudio(Data([4, 0]))
+
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(sockets.count == 2)
+        sockets[1].simulateOpen()
+        sockets[1].simulateJSON(["setupComplete": [String: Any]()])
+        await Task.yield()
+
+        #expect(eventTypes == ["ready", "speech-start", "connecting", "ready", "speech-start"])
+        let audio = jsonObject(sockets[1].sent[2]) as! [String: Any]
+        let realtime = audio["realtimeInput"] as! [String: Any]
+        let payload = realtime["audio"] as! [String: Any]
+        #expect(payload["data"] as? String == "BAA=")
         transcriber.close()
     }
 

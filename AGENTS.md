@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 `gemini-whisper-local` is a native macOS menu-bar dictation app. **GeminiWhisper.app** captures
 16 kHz mono PCM16 from the microphone, streams it to **Gemini 3.5 Transcribe Live**, optionally
 polishes with `gemini-3.5-flash-lite`, and pastes into the focused app. Right Option toggles
-dictation; Escape cancels. Not an npm package, hosted service, or Bun daemon.
+dictation; Escape cancels. Not an npm package or hosted service.
 
 Runtime: **macOS 14+**, Swift 6 package at `macos/GeminiWhisper`. The app target is
 `GeminiWhisperApp`; shared protocol/Live/polish code is `GeminiWhisperCore`.
@@ -45,17 +45,13 @@ Right Option ──► GeminiWhisper.app ──PCM16 16 kHz mono──► Gemini
 NSEvent monitors for Option taps (≤0.6s, not used as a modifier) and Escape.
 
 The polish pass overlaps Live finalization (speculative Flash-Lite). If polish fails or times out,
-the raw transcript is inserted. Audio is chunked to 100 ms frames (3,200 bytes). File mode paces
-those frames in realtime before `stop`.
-
-On launch the app boots out a leftover Bun LaunchAgent
-`gui/$UID/com.nithin.gemini-whisper` so the old helper cannot steal Option taps. Settings can
-delete that plist and optionally register the new app as a login item (`SMAppService`).
+the raw transcript is inserted. Audio is chunked to 100 ms frames (3,200 bytes). The app can
+optionally register itself as a login item (`SMAppService`).
 
 ## Security boundary
 
-The Gemini API key lives only in the app process (`.env` or environment). No localhost daemon,
-WebSocket token, or LaunchAgent is part of the current design. Error paths redact `AIza...` keys.
+The Gemini API key lives only in the app process (`.env` or environment). No localhost daemon or
+WebSocket token is part of the current design. Error paths redact `AIza...` keys.
 This is a same-user desktop app, not a defense against malware running as the same user.
 
 ## Testing conventions
@@ -73,7 +69,7 @@ the app target.
 `AGENT_INSTALL.md` is the authoritative agent-facing install procedure — read it fully before
 building or opening the app. Key constraints: never print, transmit, or commit `GEMINI_API_KEY` or
 `.env`; require the user to approve macOS Microphone/Accessibility prompts for **Gemini Whisper**
-(never bypass them); unload any old `com.nithin.gemini-whisper` LaunchAgent.
+(never bypass them).
 
 ## Out of scope (currently not implemented)
 

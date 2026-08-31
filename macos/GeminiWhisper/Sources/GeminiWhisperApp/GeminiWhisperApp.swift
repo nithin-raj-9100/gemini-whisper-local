@@ -35,9 +35,8 @@ final class AppRuntime {
             )
         }
 
-        LegacyServiceCleanup.bootout()
         if settings.openAtLogin {
-            try? LegacyServiceCleanup.setOpenAtLogin(true)
+            try? LoginItemController.setEnabled(true)
         }
 
         HotkeyMonitor.shared.onToggle = { [weak controller] in
@@ -118,10 +117,6 @@ private struct MenuBarContent: View {
             controller.cancel()
         }
         .disabled(controller.phase == .idle)
-        Button("Transcribe File…") {
-            controller.transcribeFile()
-        }
-        .disabled(controller.phase != .idle)
         Button("Audio Check") {
             Task { await controller.runAudioCheck() }
         }

@@ -1,7 +1,6 @@
 import AppKit
 import Foundation
 import Observation
-import UniformTypeIdentifiers
 
 @MainActor
 @Observable
@@ -42,7 +41,12 @@ final class DictationController {
         self.permissions = permissions
         capture.setPCMHandler { [weak self] data in
             DispatchQueue.main.async {
-                try? self?.session?.sendAudio(data)
+                guard let self, self.phase == .listening else { return }
+                do {
+                    try self.session?.sendAudio(data)
+                } catch {
+                    self.handleAudioSendFailure(AppLog.redact(error.localizedDescription))
+                }
             }
         }
     }
@@ -90,17 +94,6 @@ final class DictationController {
         phase = .idle
         targetApplication = nil
         SoundPlayer.play(.pop)
-    }
-
-    func transcribeFile() {
-        guard phase == .idle else { return }
-        let panel = NSOpenPanel()
-        panel.title = "Transcribe Audio File"
-        panel.allowedContentTypes = [.audio]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { await transcribeFile(url: url) }
     }
 
     func runAudioCheck() async {
@@ -170,23 +163,6 @@ final class DictationController {
         }
     }
 
-    private func startSessionAndConnect(apiKey: String) async throws {
-        let generation = sessionGeneration + 1
-        sessionGeneration = generation
-        let config = try CoreConfigFactory.make(settings: settings)
-        let box = CoreDictationBox(
-            apiKey: apiKey,
-            config: config,
-            intelligenceModel: settings.environment.intelligenceModel
-        ) { [weak self] event in
-            Task { @MainActor in
-                self?.handle(event, generation: generation)
-            }
-        }
-        session = box
-        try await box.connect()
-    }
-
     private func beginStop() {
         guard phase == .listening else { return }
         phase = .finalizing
@@ -230,42 +206,6 @@ final class DictationController {
         }
     }
 
-    private func transcribeFile(url: URL) async {
-        guard let apiKey = requireAPIKey() else { return }
-        cancelled = false
-        resetTranscriptState()
-        targetApplication = PasteController.frontmostApplication()
-        hud.show()
-        hud.setState("listening")
-        phase = .listening
-        lastError = ""
-        do {
-            try await startSessionAndConnect(apiKey: apiKey)
-            let pcm = try FileAudioReader.pcm16kMono(from: url)
-            for frame in FileAudioReader.realtimeFrames(from: pcm) {
-                if cancelled { return }
-                try session?.sendAudio(frame)
-                try await Task.sleep(nanoseconds: FileAudioReader.realtimeFrameNanoseconds)
-            }
-            if cancelled { return }
-            phase = .finalizing
-            hud.setState("polishing")
-            try session?.flush()
-            try session?.stop()
-            try await waitForCompletion()
-            guard !cancelled else { return }
-            await insertResult()
-        } catch {
-            guard !cancelled else { return }
-            if !draftText().isEmpty || !polishedText.isEmpty {
-                AppLog.line("File transcription failed with buffered transcript; inserting anyway.")
-                await insertResult()
-            } else {
-                handleFailure(AppLog.redact(error.localizedDescription), code: "file_transcribe_failed")
-            }
-        }
-    }
-
     private func handle(_ event: AppTranscriptEvent, generation: Int) {
         guard generation == sessionGeneration else { return }
         switch event.kind {
@@ -295,11 +235,7 @@ final class DictationController {
         case .error:
             let message = event.message.isEmpty ? event.code : "\(event.code): \(event.message)"
             if phase == .listening {
-                if !draftText().isEmpty {
-                    AppLog.line("Live error while listening with transcript (\(event.code)): \(message)")
-                    return
-                }
-                failStart(message, code: event.code)
+                handleAudioSendFailure(message, code: event.code)
             } else {
                 finishWait(with: NSError(domain: "GeminiWhisper", code: 1, userInfo: [
                     NSLocalizedDescriptionKey: message,
@@ -307,9 +243,24 @@ final class DictationController {
             }
         case .warning:
             AppLog.line("\(event.code): \(event.message)")
+        case .connecting:
+            AppLog.line("Gemini Live reconnecting; microphone audio is buffering.")
+        case .ready:
+            AppLog.line("Gemini Live ready.")
         default:
             break
         }
+    }
+
+    private func handleAudioSendFailure(_ detail: String, code: String = "audio_stream_failed") {
+        guard phase == .listening else { return }
+        AppLog.line("Microphone stream failed: \(detail)")
+        let buffered = draftText()
+        if !buffered.isEmpty {
+            lastTranscript = buffered
+        }
+        interimPreview = ""
+        handleFailure("\(detail) No text was inserted; start dictation again.", code: code)
     }
 
     private func insertResult() async {

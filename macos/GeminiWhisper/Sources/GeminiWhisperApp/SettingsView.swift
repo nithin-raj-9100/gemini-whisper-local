@@ -7,9 +7,6 @@ struct SettingsView: View {
     @Environment(PermissionsMonitor.self) private var permissions
 
     @State private var devices: [AudioDeviceList.Device] = []
-    @State private var legacyLoaded = false
-    @State private var legacyPlistExists = false
-    @State private var legacyStatus = ""
     @State private var loginItemError = ""
 
     var body: some View {
@@ -125,22 +122,7 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Legacy Bun service") {
-                LabeledContent("LaunchAgent") {
-                    Text(legacyLoaded ? "loaded — fights Right Option" : "not loaded")
-                        .foregroundStyle(legacyLoaded ? .orange : .primary)
-                }
-                LabeledContent("LaunchAgent plist") {
-                    Text(legacyPlistExists ? "present" : "absent")
-                }
-                Button("Remove legacy Bun service") {
-                    legacyStatus = LegacyServiceCleanup.removeCompletely()
-                    refreshLegacy()
-                }
-                if !legacyStatus.isEmpty {
-                    Text(legacyStatus)
-                        .textSelection(.enabled)
-                }
+            Section("App") {
                 Toggle("Open Gemini Whisper at login", isOn: Bindable(settings).openAtLogin)
                 if !loginItemError.isEmpty {
                     Text(loginItemError)
@@ -166,7 +148,6 @@ struct SettingsView: View {
         .onAppear {
             devices = AudioDeviceList.inputDevices()
             permissions.refresh()
-            refreshLegacy()
             settings.persist()
         }
         .onChange(of: settings.language) { _, _ in settings.persist() }
@@ -183,7 +164,7 @@ struct SettingsView: View {
         .onChange(of: settings.openAtLogin) { _, enabled in
             settings.persist()
             do {
-                try LegacyServiceCleanup.setOpenAtLogin(enabled)
+                try LoginItemController.setEnabled(enabled)
                 loginItemError = ""
             } catch {
                 loginItemError = error.localizedDescription
@@ -191,10 +172,6 @@ struct SettingsView: View {
         }
     }
 
-    private func refreshLegacy() {
-        legacyLoaded = LegacyServiceCleanup.isLoaded()
-        legacyPlistExists = LegacyServiceCleanup.plistExists()
-    }
 }
 
 private extension AVAuthorizationStatus {

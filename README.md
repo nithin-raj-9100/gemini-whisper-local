@@ -5,7 +5,7 @@ Tap **Right Option** to start, speak, tap **Right Option** again to stop. Flash-
 the transcript, then the app pastes into the focused field.
 
 The Gemini API key stays in the app process (loaded from an untracked `.env`). There is no localhost
-daemon, auth token, or Bun LaunchAgent.
+daemon or auth token.
 
 ## Architecture
 
@@ -63,11 +63,6 @@ On first launch, grant:
 1. **System Settings → Privacy & Security → Microphone** → Gemini Whisper
 2. **System Settings → Privacy & Security → Accessibility** → Gemini Whisper
 
-Do not grant these to Bun or “Gemini Whisper Audio”; those are the old stack.
-
-If a previous Bun LaunchAgent is still loaded, the app boots it out on launch
-(`gui/$UID/com.nithin.gemini-whisper`). Settings also has **Remove legacy Bun service**.
-
 ## Dictation
 
 Click into a text field, then:
@@ -115,7 +110,7 @@ Implemented:
 - SMART cleanup or verbatim transcription
 - Language hint and custom vocabulary
 - Automatic / hybrid / manual VAD
-- Microphone capture and paced audio-file transcription
+- Microphone capture with 100 ms realtime audio frames
 - Right Option toggle, Escape cancel, HUD, paste/copy
 
 Not yet included:

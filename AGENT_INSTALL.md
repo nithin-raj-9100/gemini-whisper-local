@@ -9,20 +9,16 @@ terminal steps. Only macOS privacy prompts require the user's click.
    Apple's dialog, and wait until `swift` and `codesign` exist.
 3. Preserve an existing `.env`; otherwise copy `.env.example` to `.env`, set mode `0600`, and have
    the user enter `GEMINI_API_KEY` without echoing it or placing it in command history.
-4. Unload any leftover Bun LaunchAgent (ignore errors if it is already gone):
-   `launchctl bootout "gui/$(id -u)/com.nithin.gemini-whisper"`
-5. From `macos/GeminiWhisper`, run `swift build`, then `./scripts/run-tests.sh`, then
+4. From `macos/GeminiWhisper`, run `swift build`, then `./scripts/run-tests.sh`, then
    `./scripts/build-app.sh`.
-6. Open the app with `open -g ../../macos/GeminiWhisper.app` (from the package directory) or
+5. Open the app with `open -g ../../macos/GeminiWhisper.app` (from the package directory) or
    `open -g macos/GeminiWhisper.app` from the repo root.
-7. Ask the user to allow **Gemini Whisper** (`com.nithin.gemini-whisper`) under
+6. Ask the user to allow **Gemini Whisper** (`com.nithin.gemini-whisper`) under
    **System Settings → Privacy & Security → Microphone** and **Accessibility** when macOS prompts.
-   These permissions must never be bypassed. Do not use Bun or “Gemini Whisper Audio”.
-8. Confirm `launchctl print "gui/$(id -u)/com.nithin.gemini-whisper"` fails (agent unloaded).
+   These permissions must never be bypassed.
 
-There is no LaunchAgent, localhost daemon, or ffmpeg requirement for dictation. The user starts
+There is no localhost daemon or ffmpeg requirement for dictation. The user starts
 dictation with Right Option after clicking a text field.
 
 To stop using the app, quit Gemini Whisper from the menu-bar extra. Optionally delete
-`macos/GeminiWhisper.app` and `~/Library/LaunchAgents/com.nithin.gemini-whisper.plist` if a leftover
-Bun plist remains. Settings → **Remove legacy Bun service** does that bootout + plist delete.
+`macos/GeminiWhisper.app`.

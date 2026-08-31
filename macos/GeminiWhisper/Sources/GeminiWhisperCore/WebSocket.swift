@@ -116,12 +116,18 @@ public final class URLSessionGeminiWebSocket: NSObject, GeminiWebSocket, URLSess
     }
 
     private func deliverErrorAndClose() {
-        if readyState != .closed {
-            onError?()
-            if readyState != .closed, readyState != .closing {
-                close(code: 1006, reason: "")
-            }
-        }
+        guard readyState != .closed else { return }
+
+        // RFC 6455 reserves 1006 for reporting an abnormal closure; it must not be
+        // sent in a close frame. More importantly, URLSession does not reliably
+        // deliver didClose after a receive/send failure followed by cancel(1006).
+        // Mark the transport closed and deliver both callbacks ourselves so the
+        // transcriber can reconnect instead of remaining stuck in `.ready` while
+        // this wrapper is permanently `.closing`.
+        readyState = .closed
+        onError?()
+        onClose?(1006, "transport error")
+        session.invalidateAndCancel()
     }
 }
 

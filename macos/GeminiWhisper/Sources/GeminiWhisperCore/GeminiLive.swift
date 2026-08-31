@@ -128,6 +128,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     private var lastAudioSentAt: Double = 0
     private var lastTurnCompleteAt: Double = 0
     private var latestInterim = ""
+    private var interimAccumulator = InterimTranscriptAccumulator()
     private var lastFinal = ""
     private var hasTranscript = false
     private var fastFinishGraceElapsed = false
@@ -171,11 +172,20 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             throw TranscriptionError("Cannot send audio after the session is finishing.")
         }
         if state != .ready {
-            if queuedBytes + chunk.count > MAX_BUFFERED_AUDIO_BYTES {
-                throw TranscriptionError("Audio queue exceeded 10 seconds while Gemini was connecting.")
+            try queueAudio(chunk)
+            return
+        }
+
+        // A URLSession transport failure can change the wrapper state before its
+        // close delegate callback arrives. Buffer this frame and start recovery
+        // here as well; otherwise every microphone frame is rejected during that
+        // callback gap and the UI appears to keep listening with a frozen draft.
+        guard socket?.readyState == .open else {
+            try queueAudio(chunk)
+            recoverUnavailableSocket()
+            if state == .closed {
+                throw TranscriptionError("Gemini Live connection could not be restored.")
             }
-            queuedAudio.append(chunk)
-            queuedBytes += chunk.count
             return
         }
         lastAudioSentAt = nowMilliseconds()
@@ -254,9 +264,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         }
         socket.onError = { [weak self, weak socket] in
             guard let self, let socket, socket === self.socket else { return }
-            if socket.readyState != .closed {
-                socket.close(code: 1006, reason: "")
-            }
+            self.recoverUnavailableSocket()
         }
         socket.onClose = { [weak self, weak socket] code, reason in
             guard let self, let socket, socket === self.socket else { return }
@@ -361,27 +369,29 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                 continue
             }
             if case .interim(let text) = event {
-                latestInterim = text
+                let merged = interimAccumulator.accept(text)
+                latestInterim = merged
+                options.emit(.interim(text: merged))
+                if state == .finishing,
+                   fastFinishGraceElapsed,
+                   commitInterimFallback()
+                {
+                    options.emit(.warning(
+                        code: "finalization_ack_timeout",
+                        message: "Gemini did not acknowledge finalization; using its latest buffered transcript."
+                    ))
+                    emitComplete()
+                    close()
+                }
+                continue
             }
             if case .final(let text) = event {
+                interimAccumulator.reset()
                 latestInterim = ""
                 lastFinal = text
                 hasTranscript = true
             }
             options.emit(event)
-            if case .interim = event,
-               state == .finishing,
-               fastFinishGraceElapsed,
-               commitInterimFallback()
-            {
-                options.emit(.warning(
-                    code: "finalization_ack_timeout",
-                    message: "Gemini did not acknowledge finalization; using its latest buffered transcript."
-                ))
-                emitComplete()
-                close()
-                continue
-            }
             if case .final = event, state == .finishing {
                 emitComplete()
                 close()
@@ -394,6 +404,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         connectTimeoutTask?.cancel()
         connectTimeoutTask = nil
         state = .ready
+        reconnectAttempts = 0
         connectContinuation?.resume()
         connectContinuation = nil
 
@@ -437,6 +448,27 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         ])
     }
 
+    private func queueAudio(_ chunk: Data) throws {
+        if queuedBytes + chunk.count > MAX_BUFFERED_AUDIO_BYTES {
+            throw TranscriptionError("Audio queue exceeded 10 seconds while Gemini was reconnecting.")
+        }
+        queuedAudio.append(chunk)
+        queuedBytes += chunk.count
+    }
+
+    private func recoverUnavailableSocket() {
+        guard state != .closed, state != .finishing, let failedSocket = socket else { return }
+
+        // Detach first. URLSession and test sockets may synchronously invoke their
+        // close callback; its identity guard will then ignore this already-handled
+        // transport so reconnect attempts are counted exactly once.
+        socket = nil
+        handleClose(code: 1006, reason: "transport error")
+        if failedSocket.readyState != .closed {
+            failedSocket.close(code: 1001, reason: "reconnecting")
+        }
+    }
+
     private func sendJSON(_ message: [String: Any]) throws {
         guard let socket, socket.readyState == .open else {
             throw TranscriptionError("Gemini Live socket is not open.")
@@ -451,6 +483,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     @discardableResult
     private func commitInterimFallback() -> Bool {
         let text = latestInterim.trimmingCharacters(in: .whitespacesAndNewlines)
+        interimAccumulator.reset()
         latestInterim = ""
         if text.isEmpty || normalizeTranscript(text) == normalizeTranscript(lastFinal) {
             return false
@@ -572,4 +605,123 @@ private func sanitizeCloseReason(_ reason: String) -> String {
 private func normalizeTranscript(_ text: String) -> String {
     let collapsed = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
     return collapsed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+}
+
+/// Holds already completed interim windows separately from the one hypothesis
+/// Gemini is still revising. This prevents a revised active tail from being
+/// appended repeatedly and fabricating duplicate paragraphs.
+struct InterimTranscriptAccumulator {
+    private var committed = ""
+    private var active = ""
+
+    var text: String {
+        joinUniqueTranscript(committed, active)
+    }
+
+    mutating func accept(_ update: String) -> String {
+        let incoming = update.trimmingCharacters(in: .whitespacesAndNewlines)
+        if incoming.isEmpty { return text }
+        if active.isEmpty {
+            active = incoming
+            return text
+        }
+
+        if let reconciled = reconcileHypothesis(active, incoming) {
+            active = reconciled
+            return text
+        }
+
+        let oldWords = transcriptWords(active)
+        let newWords = transcriptWords(incoming)
+        let isShortReset = oldWords.count >= 8 && newWords.count * 10 <= oldWords.count * 7
+        let beginsAsContinuation = incoming.first?.isLowercase == true
+        if isShortReset || beginsAsContinuation {
+            committed = joinUniqueTranscript(committed, active)
+        }
+        active = incoming
+        return text
+    }
+
+    mutating func reset() {
+        committed = ""
+        active = ""
+    }
+}
+
+/// Returns a single revised active hypothesis when two updates are related, or
+/// nil when the incoming text begins a genuinely new window.
+private func reconcileHypothesis(_ previous: String, _ update: String) -> String? {
+    let oldWords = transcriptWords(previous)
+    let newWords = transcriptWords(update)
+    if oldWords.isEmpty || newWords.isEmpty { return update }
+    if oldWords == newWords { return update }
+
+    let commonPrefix = zip(oldWords, newWords).prefix { $0.0 == $0.1 }.count
+    if commonPrefix >= 2
+        || commonPrefix * 2 >= min(oldWords.count, newWords.count)
+    {
+        return update
+    }
+
+    // A sliding update can restart from words already present inside the active
+    // hypothesis. Keep the untouched prefix and replace only its tail.
+    if newWords.count >= 2 {
+        for index in oldWords.indices where index + 1 < oldWords.count {
+            if oldWords[index] == newWords[0], oldWords[index + 1] == newWords[1] {
+                let prefix = originalWords(previous).prefix(index).joined(separator: " ")
+                return joinUniqueTranscript(prefix, update)
+            }
+        }
+    }
+
+    // Or it can continue from the end of the current active hypothesis.
+    let maximumOverlap = min(oldWords.count, newWords.count)
+    if maximumOverlap >= 2 {
+        for count in stride(from: maximumOverlap, through: 2, by: -1) {
+            if oldWords.suffix(count).elementsEqual(newWords.prefix(count)) {
+                return joinUniqueTranscript(previous, updateWords(update, dropping: count))
+            }
+        }
+    }
+    return nil
+}
+
+private func transcriptWords(_ text: String) -> [String] {
+    text.split(whereSeparator: { $0.isWhitespace }).map { token in
+        token.lowercased().filter { $0.isLetter || $0.isNumber }
+    }.filter { !$0.isEmpty }
+}
+
+private func originalWords(_ text: String) -> [Substring] {
+    text.split(whereSeparator: { $0.isWhitespace })
+}
+
+private func updateWords(_ text: String, dropping count: Int) -> String {
+    text.split(whereSeparator: { $0.isWhitespace })
+        .dropFirst(count)
+        .joined(separator: " ")
+}
+
+private func joinUniqueTranscript(_ left: String, _ right: String) -> String {
+    let lhs = left.trimmingCharacters(in: .whitespacesAndNewlines)
+    let rhs = right.trimmingCharacters(in: .whitespacesAndNewlines)
+    if lhs.isEmpty { return rhs }
+    if rhs.isEmpty { return lhs }
+
+    let normalizedLeft = normalizeTranscript(lhs)
+    let normalizedRight = normalizeTranscript(rhs)
+    if normalizedLeft.contains(normalizedRight) { return lhs }
+    if normalizedRight.contains(normalizedLeft) { return rhs }
+
+    let leftWords = transcriptWords(lhs)
+    let rightWords = transcriptWords(rhs)
+    let maximumOverlap = min(leftWords.count, rightWords.count)
+    if maximumOverlap >= 2 {
+        for count in stride(from: maximumOverlap, through: 2, by: -1) {
+            if leftWords.suffix(count).elementsEqual(rightWords.prefix(count)) {
+                return lhs + " " + updateWords(rhs, dropping: count)
+            }
+        }
+    }
+    return lhs + " " + rhs
 }
