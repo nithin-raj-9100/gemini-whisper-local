@@ -122,9 +122,22 @@ private struct MenuBarContent: View {
         }
         .disabled(controller.phase != .idle)
         Divider()
-        SettingsLink {
-            Text("Settings…")
+        Button("Settings…") {
+            NSApp.activate(ignoringOtherApps: true)
+            if #available(macOS 14.0, *) {
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            } else {
+                NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                NSApp.activate(ignoringOtherApps: true)
+                for window in NSApp.windows where window.canBecomeKey {
+                    window.makeKeyAndOrderFront(nil)
+                    window.orderFrontRegardless()
+                }
+            }
         }
+        .keyboardShortcut(",")
         Button("Quit Gemini Whisper") {
             NSApp.terminate(nil)
         }

@@ -146,9 +146,17 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(minWidth: 480, minHeight: 520)
         .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
             devices = AudioDeviceList.inputDevices()
             permissions.refresh()
             settings.persist()
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                for window in NSApp.windows where window.canBecomeKey {
+                    window.makeKeyAndOrderFront(nil)
+                    window.orderFrontRegardless()
+                }
+            }
         }
         .onChange(of: settings.language) { _, _ in settings.persist() }
         .onChange(of: settings.vocabularyText) { _, _ in settings.persist() }
