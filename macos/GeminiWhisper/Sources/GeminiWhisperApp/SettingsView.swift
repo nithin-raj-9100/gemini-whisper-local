@@ -178,8 +178,31 @@ struct SettingsView: View {
                 loginItemError = error.localizedDescription
             }
         }
+        .background(SettingsWindowActivator())
+    }
+}
+
+private struct SettingsWindowActivator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            activateWindow(for: view)
+        }
+        return view
     }
 
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            activateWindow(for: nsView)
+        }
+    }
+
+    private func activateWindow(for view: NSView) {
+        guard let window = view.window else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
 }
 
 private extension AVAuthorizationStatus {

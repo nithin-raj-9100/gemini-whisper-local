@@ -98,6 +98,8 @@ private struct MenuBarLabel: View {
 }
 
 private struct MenuBarContent: View {
+    @Environment(\.openSettings) private var openSettings
+
     var body: some View {
         let controller = AppRuntime.shared.controller
         Text("Gemini Whisper — \(controller.statusTitle)")
@@ -124,18 +126,7 @@ private struct MenuBarContent: View {
         Divider()
         Button("Settings…") {
             NSApp.activate(ignoringOtherApps: true)
-            if #available(macOS 14.0, *) {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-            } else {
-                NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                NSApp.activate(ignoringOtherApps: true)
-                for window in NSApp.windows where window.canBecomeKey {
-                    window.makeKeyAndOrderFront(nil)
-                    window.orderFrontRegardless()
-                }
-            }
+            openSettings()
         }
         .keyboardShortcut(",")
         Button("Quit Gemini Whisper") {
