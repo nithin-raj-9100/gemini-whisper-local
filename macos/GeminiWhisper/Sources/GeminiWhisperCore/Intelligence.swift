@@ -15,8 +15,10 @@ Developer Prompt Compression:
 - Preserve exact casing when the speaker spells or names an identifier. Render spoken code punctuation and common symbols only when the coding context is clear.
 - Use compact bullets or numbered steps when they reduce tokens and improve scanability. If there are two or more enumeration cues, ALWAYS format the items as a vertical numbered list using "1.", "2.", etc.
 
-General Cleanup:
-Repair grammar, punctuation, casing, spacing, fillers, stutters, and accidental repeated fragments. Keep only the corrected wording after an explicit self-correction such as "sorry", "actually", or "scratch that". Interpret spoken punctuation and layout commands instead of printing them. Make genuine questions grammatical and end them with "?". Preserve meaning, claims, uncertainty, tone, names, numbers, and language.
+General Cleanup & Acoustic Artifact Repair:
+- Repair grammar, punctuation, casing, spacing, fillers, stutters, and accidental repeated fragments. Keep only the corrected wording after an explicit self-correction such as "sorry", "actually", or "scratch that". Interpret spoken punctuation and layout commands instead of printing them. Make genuine questions grammatical and end them with "?". Preserve meaning, claims, uncertainty, tone, names, numbers, and language.
+- Acoustic Hallucination & Phonetic Slip Repair: Detect and repair obvious speech-to-text acoustic misrecognitions where a transcribed word or phrase is phonetically plausible but semantically nonsensical in a software, debugging, or developer prompt (e.g. "Purchases do not inherit" -> "Please do not edit", "first off are being cut off" -> "first few words are being cut off", "check the validity and PUC" -> "check the validity and POC").
+- Purge Stray Acoustic Noise & Foreign Script Hallucinations: Strip isolated, stray non-Latin tokens (such as stray Chinese, Japanese, Korean, Arabic, or Devanagari characters like "能不能") that accidentally appear embedded in an otherwise English sentence due to background noise or token hallucinations, unless the speaker is genuinely speaking that language or code-switching.
 
 Multilingual, Script & Code-Switching Normalization:
 - Maintain consistent script and vocabulary across any language or mixed speech (English, Spanish, Hindi, French, German, Japanese, Chinese, Arabic, Russian, etc.).
@@ -45,6 +47,9 @@ My tasks are:
 Example input: Due to major faults and आर एनिमीज
 Example output:
 Due to major faults and are enemies
+
+Example input: Purchases do not inherit, do not edit anything yet. check the eligibility of能不能 the batch API.
+Example output: Please do not edit anything yet. Check the eligibility of the batch API.
 """
 
 private let TIMEOUT_MS: TimeInterval = 15

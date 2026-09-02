@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import GeminiWhisperCore
 import Observation
 
 @MainActor
@@ -24,6 +25,7 @@ final class DictationController {
     let hud: FloatingHUDController
     let capture = MicrophoneCapture()
 
+    private var isStreamingAudio = false
     private var session: CoreDictationBox?
     private var targetApplication: String?
     private var cancelled = false
@@ -31,6 +33,7 @@ final class DictationController {
     private var finalSegments: [String] = []
     private var latestInterim: String = ""
     private var polishedText: String = ""
+    private var polishedInput: String = ""
     private var completion: CheckedContinuation<Void, Error>?
     private var stopRequestedAt: UInt64 = 0
     private var sessionGeneration = 0
@@ -41,7 +44,7 @@ final class DictationController {
         self.permissions = permissions
         capture.setPCMHandler { [weak self] data in
             DispatchQueue.main.async {
-                guard let self, self.phase == .listening else { return }
+                guard let self, self.isStreamingAudio else { return }
                 do {
                     try self.session?.sendAudio(data)
                 } catch {
@@ -84,6 +87,7 @@ final class DictationController {
         guard phase != .idle else { return }
         AppLog.line("Dictation cancelled (Escape).")
         cancelled = true
+        isStreamingAudio = false
         sessionGeneration += 1
         finishWait(with: nil)
         capture.pause()
@@ -119,6 +123,7 @@ final class DictationController {
         hud.setState("listening")
         SoundPlayer.play(.tink)
         phase = .listening
+        isStreamingAudio = true
         lastError = ""
         AppLog.line("Option: starting dictation.")
 
@@ -177,6 +182,7 @@ final class DictationController {
                 try? await Task.sleep(nanoseconds: tailNs)
             }
             guard self.sessionGeneration == generation, !self.cancelled else { return }
+            self.isStreamingAudio = false
             self.capture.pause()
             do {
                 try self.session?.flush()
@@ -224,8 +230,19 @@ final class DictationController {
             interimPreview = draftText()
         case .polished:
             polishedText = event.text
+            let rawDraft = (finalSegments + [latestInterim])
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rawDraft.isEmpty {
+                polishedInput = rawDraft
+            }
             lastPolishLatencyMs = event.latencyMs
             lastSpeculative = event.speculative
+            if phase == .listening {
+                hud.updateText(draftText())
+                interimPreview = draftText()
+            }
         case .complete:
             didComplete = true
             finishWait(with: nil)
@@ -254,16 +271,22 @@ final class DictationController {
 
     private func handleAudioSendFailure(_ detail: String, code: String = "audio_stream_failed") {
         guard phase == .listening else { return }
+        isStreamingAudio = false
         AppLog.line("Microphone stream failed: \(detail)")
         let buffered = draftText()
         if !buffered.isEmpty {
-            lastTranscript = buffered
+            AppLog.line("Microphone stream failed with buffered text present; inserting transcript.")
+            Task {
+                await self.insertResult()
+            }
+            return
         }
         interimPreview = ""
         handleFailure("\(detail) No text was inserted; start dictation again.", code: code)
     }
 
     private func insertResult() async {
+        isStreamingAudio = false
         hud.hide()
         let text = polishedText.isEmpty ? draftText() : polishedText
         session?.close()
@@ -311,6 +334,7 @@ final class DictationController {
     }
 
     private func handleFailure(_ detail: String, code: String = "") {
+        isStreamingAudio = false
         hud.setState("error")
         hud.hide()
         capture.pause()
@@ -325,6 +349,7 @@ final class DictationController {
     }
 
     private func failStart(_ message: String, code: String = "") {
+        isStreamingAudio = false
         capture.pause()
         session?.close()
         session = nil
@@ -353,6 +378,7 @@ final class DictationController {
         finalSegments = []
         latestInterim = ""
         polishedText = ""
+        polishedInput = ""
         lastPolishLatencyMs = 0
         lastSpeculative = false
         interimPreview = ""
@@ -385,7 +411,37 @@ final class DictationController {
     }
 
     private func draftText() -> String {
-        (finalSegments + [latestInterim]).filter { !$0.isEmpty }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawDraft = (finalSegments + [latestInterim])
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !polishedText.isEmpty else {
+            return rawDraft
+        }
+
+        // Gapless Compositor:
+        // 1. If rawDraft matches polishedInput, show polishedText directly.
+        if transcriptsCompatible(polishedInput, rawDraft) {
+            return polishedText
+        }
+
+        // 2. If rawDraft has newly arrived text (unpolished final segments or active interim),
+        // extract whatever trailing extension was NOT yet polished and append it seamlessly.
+        // Completed words NEVER vanish or flicker!
+        if !polishedInput.isEmpty,
+           let trailing = extractTrailingExtension(prefix: polishedInput, full: rawDraft),
+           !trailing.isEmpty
+        {
+            return joinUniqueTranscript(polishedText, trailing)
+        }
+
+        // 3. If there is an active interim stream not yet part of the polished text, append it.
+        if !latestInterim.isEmpty && !polishedText.contains(latestInterim) {
+            return (polishedText + "\n" + latestInterim).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return polishedText
     }
 
     private func finishWait(with error: Error?) {

@@ -106,8 +106,22 @@ struct DictationSessionTests {
             "one two three four five six seven eight nine ten",
             "one two three four five six seven eight nine tens"
         ))
+        #expect(!transcriptsCompatible(
+            "one two three four five six seven eight nine ten",
+            "one two three four five six seven eight nine ten eleven"
+        ))
         #expect(!transcriptsCompatible("one two three", "alpha beta gamma"))
         #expect(!transcriptsCompatible("", "hello"))
+    }
+
+    @Test func extractTrailingExtensionFindsAppendedWordsWhenPrefixMatches() {
+        let prefix = "I am using my own application to prompt this"
+        let full = "I am using my own application to prompt this very prompt in you"
+        let extensionWords = extractTrailingExtension(prefix: prefix, full: full)
+        #expect(extensionWords == "very prompt in you")
+
+        #expect(extractTrailingExtension(prefix: "completely different text", full: full) == nil)
+        #expect(extractTrailingExtension(prefix: full, full: prefix) == nil)
     }
 
     @Test func ignoresMidSessionCompleteAndKeepsAcceptingAudioUntilStop() async throws {

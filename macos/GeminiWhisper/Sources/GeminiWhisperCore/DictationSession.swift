@@ -47,6 +47,7 @@ public final class DictationSession: @unchecked Sendable {
 
     private struct SpeculativePolish {
         var input: String
+        var output: String?
         var startedBeforeFinal: Bool
         var task: Task<Result<IntelligenceResult, Error>, Never>
     }
@@ -196,8 +197,8 @@ public final class DictationSession: @unchecked Sendable {
         case .final(let text):
             latestInterim = ""
             finalSegments.append(text)
-            if polishEnabled, state == .finishing, intelligence != nil {
-                startSpeculativePolish(replaceIfChanged: true)
+            if polishEnabled, options.speculativeIntelligence, intelligence != nil {
+                startSpeculativePolish(replaceIfChanged: true, startedBeforeFinal: true)
             }
             options.emit(event)
         case .complete:
@@ -233,22 +234,66 @@ public final class DictationSession: @unchecked Sendable {
     }
 
     private func startSpeculativePolish(replaceIfChanged: Bool = false, startedBeforeFinal: Bool = false) {
-        guard let intelligence else { return }
+        guard let intelligence, polishEnabled, options.speculativeIntelligence else { return }
         let draft = transcriptDraft(finalSegments: finalSegments, latestInterim: latestInterim)
         if draft.isEmpty { return }
         if let existing = speculativePolish {
-            if !replaceIfChanged || transcriptsCompatible(existing.input, draft) { return }
-            existing.task.cancel()
+            if transcriptsCompatible(existing.input, draft) { return }
+            // If the existing task is still in flight and we haven't received an output yet,
+            // don't cancel it on regular speech updates so its output can be reused as a prefix.
+            if !replaceIfChanged && existing.output == nil {
+                return
+            }
         }
-        let task = Task<Result<IntelligenceResult, Error>, Never> {
+
+        let prefixPolish: (input: String, output: String)? = {
+            if let existing = speculativePolish, let out = existing.output {
+                if let tail = extractTrailingExtension(prefix: existing.input, full: draft), !tail.isEmpty {
+                    return (existing.input, out)
+                }
+            }
+            return nil
+        }()
+
+        let targetToPolish: String
+        let basePrefix: String?
+        if let prefixPolish, let tail = extractTrailingExtension(prefix: prefixPolish.input, full: draft), tail.split(separator: " ").count <= 35 {
+            targetToPolish = tail
+            basePrefix = prefixPolish.output
+        } else {
+            targetToPolish = draft
+            basePrefix = nil
+            speculativePolish?.task.cancel()
+        }
+
+        let task = Task<Result<IntelligenceResult, Error>, Never> { [weak self] in
             do {
-                return .success(try await intelligence.polish(draft))
+                let polishedResult = try await intelligence.polish(targetToPolish)
+                guard let self, !self.discarded else {
+                    return .success(polishedResult)
+                }
+                let fullText = basePrefix != nil ? joinUniqueTranscript(basePrefix!, polishedResult.text) : polishedResult.text
+                let combinedResult = IntelligenceResult(
+                    text: fullText,
+                    model: polishedResult.model,
+                    latencyMs: polishedResult.latencyMs
+                )
+                self.speculativePolish?.output = fullText
+                self.options.emit(.polished(
+                    text: fullText,
+                    model: combinedResult.model,
+                    latencyMs: combinedResult.latencyMs,
+                    speculative: true
+                ))
+                return .success(combinedResult)
             } catch {
                 return .failure(error)
             }
         }
+
         speculativePolish = SpeculativePolish(
             input: draft,
+            output: basePrefix,
             startedBeforeFinal: startedBeforeFinal,
             task: task
         )
@@ -256,9 +301,6 @@ public final class DictationSession: @unchecked Sendable {
 
     private func finishWithIntelligence() async {
         if discarded { return }
-        if polishEnabled, options.speculativeIntelligence, intelligence != nil, state == .finishing {
-            startSpeculativePolish(replaceIfChanged: true)
-        }
         state = .finishing
         let transcript = transcriptDraft(finalSegments: finalSegments, latestInterim: latestInterim)
 
@@ -267,25 +309,44 @@ public final class DictationSession: @unchecked Sendable {
                 let speculative = speculativePolish
                 let speculativeResult = speculative == nil ? nil : await speculative!.task.value
                 if discarded { return }
-                let reusedSpeculative =
-                    speculative != nil
-                    && {
-                        if case .success = speculativeResult { return true }
-                        return false
-                    }()
-                    && transcriptsCompatible(speculative!.input, transcript)
+
                 let result: IntelligenceResult
-                if reusedSpeculative, case .success(let value) = speculativeResult {
+                if let speculative,
+                   let out = speculative.output,
+                   transcriptsCompatible(speculative.input, transcript),
+                   !out.isEmpty
+                {
+                    result = IntelligenceResult(text: out, model: GEMINI_INTELLIGENCE_MODEL, latencyMs: 0)
+                } else if case .success(let value) = speculativeResult,
+                          speculative != nil,
+                          transcriptsCompatible(speculative!.input, transcript)
+                {
                     result = value
+                } else if let speculative,
+                          let baseText = (speculative.output ?? (try? speculativeResult?.get().text)),
+                          let trailingTail = extractTrailingExtension(prefix: speculative.input, full: transcript),
+                          !trailingTail.isEmpty,
+                          trailingTail.split(separator: " ").count <= 35
+                {
+                    // Parallel pipelining: If the prefix of the transcript was already polished
+                    // in the background while the user was speaking, polish only the newly added tail!
+                    let polishedTail = try await intelligence.polish(trailingTail)
+                    let combined = joinUniqueTranscript(baseText, polishedTail.text)
+                    result = IntelligenceResult(
+                        text: combined,
+                        model: polishedTail.model,
+                        latencyMs: polishedTail.latencyMs
+                    )
                 } else {
                     result = try await intelligence.polish(transcript)
                 }
                 if discarded { return }
+                let wasSpeculative = (speculative != nil && (transcriptsCompatible(speculative!.input, transcript) || extractTrailingExtension(prefix: speculative!.input, full: transcript) != nil)) && speculative?.startedBeforeFinal == true
                 options.emit(.polished(
                     text: result.text,
                     model: result.model,
                     latencyMs: result.latencyMs,
-                    speculative: reusedSpeculative && speculative?.startedBeforeFinal == true ? true : nil
+                    speculative: wasSpeculative ? true : nil
                 ))
             } catch {
                 if discarded { return }
@@ -316,14 +377,34 @@ public func transcriptsCompatible(_ draft: String, _ final: String) -> Bool {
     if left == right { return true }
     let leftWords = left.split(separator: " ").map(String.init)
     let rightWords = right.split(separator: " ").map(String.init)
-    let length = max(leftWords.count, rightWords.count)
+    // If the final transcript has different word count (e.g. newly arrived end words),
+    // speculative polish based on the draft cannot contain them. Never reuse in that case.
+    if leftWords.count != rightWords.count { return false }
+    let length = leftWords.count
     var matching = 0
-    for index in 0..<min(leftWords.count, rightWords.count) {
+    for index in 0..<length {
         if leftWords[index] == rightWords[index] {
             matching += 1
         }
     }
-    return Double(matching) / Double(length) >= 0.9 && abs(left.count - right.count) <= 32
+    return Double(matching) / Double(length) >= 0.9
+}
+
+public func extractTrailingExtension(prefix: String, full: String) -> String? {
+    let left = normalizeForComparison(prefix)
+    let right = normalizeForComparison(full)
+    if left.isEmpty || right.isEmpty { return nil }
+    let prefixWords = left.split(separator: " ").map(String.init)
+    let fullWords = right.split(separator: " ").map(String.init)
+    guard !prefixWords.isEmpty, fullWords.count > prefixWords.count else { return nil }
+    let commonPrefix = zip(prefixWords, fullWords).prefix { $0.0 == $0.1 }.count
+    if Double(commonPrefix) / Double(prefixWords.count) >= 0.9 {
+        let originalWords = full.split(separator: " ").map(String.init)
+        if originalWords.count > commonPrefix {
+            return originalWords.dropFirst(commonPrefix).joined(separator: " ")
+        }
+    }
+    return nil
 }
 
 private func normalizeForComparison(_ text: String) -> String {

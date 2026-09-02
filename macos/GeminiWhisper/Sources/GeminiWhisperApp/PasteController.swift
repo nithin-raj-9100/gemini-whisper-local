@@ -12,7 +12,7 @@ enum PasteController {
     /// kVK_Command
     private static let keyCodeCommand: CGKeyCode = 0x37
     private static let pasteboardSettleNanoseconds: UInt64 = 50_000_000
-    private static let pasteConsumeNanoseconds: UInt64 = 400_000_000
+    private static let pasteConsumeNanoseconds: UInt64 = 800_000_000
 
     static var executableURL: URL {
         Bundle.main.executableURL ?? Bundle.main.bundleURL
@@ -70,13 +70,14 @@ enum PasteController {
         }
 
         let currentApplication = frontmostApplication()
-        if let expectedApplication, let currentApplication, currentApplication != expectedApplication {
+        if let currentApplication, currentApplication == "GeminiWhisper" || currentApplication == "GeminiWhisperApp" {
             try copyText(text)
-            AppLog.line("Paste skipped; focus moved \(expectedApplication) -> \(currentApplication)")
-            UserNotify.show(
-                "Focus moved from \(expectedApplication) to \(currentApplication). The transcript was copied instead of pasted."
-            )
+            AppLog.line("Paste skipped; frontmost application is GeminiWhisper. Copied to clipboard.")
             return false
+        }
+
+        if let expectedApplication, let currentApplication, currentApplication != expectedApplication {
+            AppLog.line("Focus moved \(expectedApplication) -> \(currentApplication); pasting into currently focused \(currentApplication)")
         }
 
         let pasteboard = NSPasteboard.general

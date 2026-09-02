@@ -106,6 +106,43 @@ struct GeminiLiveTests {
         #expect(result.components(separatedBy: "oh my god should become OMG").count == 2)
     }
 
+    @Test func preservesPriorSentenceWhenNewSentenceBeginsWithCapitalLetters() {
+        var accumulator = InterimTranscriptAccumulator()
+        _ = accumulator.accept("There are two types of inconsistencies observed in this application.")
+        let second = accumulator.accept("Second inconsistency is sometimes the end words are being cut off.")
+        #expect(second == "There are two types of inconsistencies observed in this application. Second inconsistency is sometimes the end words are being cut off.")
+    }
+
+    @Test func finalEventPreservesAccumulatedInterimText() async throws {
+        let socket = FakeWebSocket()
+        var events: [ServerEvent] = []
+        let transcriber = GeminiLiveTranscriber(
+            apiKey: "test-only",
+            config: .default,
+            emit: { events.append($0) },
+            webSocketFactory: { _ in socket }
+        )
+
+        async let connected: Void = transcriber.connect()
+        await Task.yield()
+        socket.simulateOpen()
+        socket.simulateJSON(["setupComplete": [String: Any]()])
+        try await connected
+        await Task.yield()
+
+        socket.simulateJSON([
+            "serverContent": ["interimInputTranscription": ["text": "First sentence was spoken earlier."]],
+        ])
+        await Task.yield()
+
+        socket.simulateJSON([
+            "serverContent": ["inputTranscription": ["text": "Second sentence is final."]],
+        ])
+        await Task.yield()
+
+        #expect(events.contains(.final(text: "First sentence was spoken earlier. Second sentence is final.")))
+    }
+
     @Test func keepsSessionOpenThroughMidUtteranceTurnCompleteAndPauseAudio() async throws {
         let socket = FakeWebSocket()
         var eventTypes: [String] = []

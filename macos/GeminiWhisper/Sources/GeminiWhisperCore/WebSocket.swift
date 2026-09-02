@@ -35,6 +35,8 @@ public final class URLSessionGeminiWebSocket: NSObject, GeminiWebSocket, URLSess
         super.init()
         let configuration = URLSessionConfiguration.default
         configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 900
+        configuration.timeoutIntervalForResource = 900
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
         task = session.webSocketTask(with: url)
         task.resume()

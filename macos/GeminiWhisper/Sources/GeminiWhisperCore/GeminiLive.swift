@@ -10,7 +10,7 @@ private let HARD_FINISH_TIMEOUT_MS: UInt64 = 3_500
 private let SESSION_TIMEOUT_MS: UInt64 = 9 * 60 * 1000
 private let MAX_BUFFERED_AUDIO_BYTES = 16_000 * 2 * 10
 private let RACE_WINDOW_MS: Double = 800
-private let MAX_RECONNECT_ATTEMPTS = 2
+private let MAX_RECONNECT_ATTEMPTS = 5
 private let RECONNECT_DELAY_MS: UInt64 = 200
 
 public protocol LiveTranscriber: AnyObject {
@@ -169,7 +169,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     public func sendAudio(_ chunk: Data) throws {
         try validatePcmChunk(chunk)
         if state == .finishing || state == .closed {
-            throw TranscriptionError("Cannot send audio after the session is finishing.")
+            return
         }
         if state != .ready {
             try queueAudio(chunk)
@@ -286,6 +286,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
 
         if !wasExpected, !wasFinishing, code != 1008, reconnectAttempts < MAX_RECONNECT_ATTEMPTS {
             reconnectAttempts += 1
+            commitInterimFallback()
             state = .connecting
             options.emit(.connecting)
             reconnectTask = Task { [weak self] in
@@ -386,15 +387,18 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                 continue
             }
             if case .final(let text) = event {
+                let accumulated = interimAccumulator.text
+                let fullText = joinUniqueTranscript(accumulated, text)
                 interimAccumulator.reset()
                 latestInterim = ""
-                lastFinal = text
+                lastFinal = fullText
                 hasTranscript = true
-            }
-            options.emit(event)
-            if case .final = event, state == .finishing {
-                emitComplete()
-                close()
+                options.emit(.final(text: fullText))
+                if state == .finishing {
+                    emitComplete()
+                    close()
+                }
+                continue
             }
         }
     }
@@ -631,13 +635,10 @@ struct InterimTranscriptAccumulator {
             return text
         }
 
-        let oldWords = transcriptWords(active)
-        let newWords = transcriptWords(incoming)
-        let isShortReset = oldWords.count >= 8 && newWords.count * 10 <= oldWords.count * 7
-        let beginsAsContinuation = incoming.first?.isLowercase == true
-        if isShortReset || beginsAsContinuation {
-            committed = joinUniqueTranscript(committed, active)
-        }
+        // When incoming cannot be reconciled as an edit or extension of active,
+        // active represents preceding speech and must be committed so earlier words
+        // are never lost when a new sentence or window begins.
+        committed = joinUniqueTranscript(committed, active)
         active = incoming
         return text
     }
@@ -657,10 +658,14 @@ private func reconcileHypothesis(_ previous: String, _ update: String) -> String
     if oldWords == newWords { return update }
 
     let commonPrefix = zip(oldWords, newWords).prefix { $0.0 == $0.1 }.count
-    if commonPrefix >= 2
-        || commonPrefix * 2 >= min(oldWords.count, newWords.count)
-    {
-        return update
+    if newWords.count >= oldWords.count {
+        if commonPrefix >= 2 || commonPrefix * 2 >= oldWords.count {
+            return update
+        }
+    } else {
+        if abs(oldWords.count - newWords.count) <= 3 && commonPrefix >= 2 {
+            return update
+        }
     }
 
     // A sliding update can restart from words already present inside the active
@@ -702,7 +707,7 @@ private func updateWords(_ text: String, dropping count: Int) -> String {
         .joined(separator: " ")
 }
 
-private func joinUniqueTranscript(_ left: String, _ right: String) -> String {
+public func joinUniqueTranscript(_ left: String, _ right: String) -> String {
     let lhs = left.trimmingCharacters(in: .whitespacesAndNewlines)
     let rhs = right.trimmingCharacters(in: .whitespacesAndNewlines)
     if lhs.isEmpty { return rhs }
