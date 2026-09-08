@@ -40,6 +40,14 @@ Example input: Purchases do not inherit, do not edit anything yet. check the eli
 Example output: Please do not edit anything yet. Check the eligibility of the batch API.
 """
 
+/// Below this the full rewrite is already short enough that the patch prompt,
+/// JSON output, and the risk of a repair round trip cost more than they save.
+public let PATCH_EDITING_MINIMUM_WORDS = 40
+
+/// Sentinel appended to `statuses` when a patch was rejected and a full rewrite
+/// had to follow. Two round trips, so it must be visible in the latency log.
+public let PATCH_FALLBACK_STATUS = -2
+
 private let TIMEOUT_MS: TimeInterval = 15
 private let MAX_TRANSCRIPT_CHARACTERS = 50_000
 private let MAX_ATTEMPTS = 2
@@ -48,9 +56,18 @@ public protocol TranscriptIntelligence: Sendable {
     func polish(_ transcript: String) async throws -> IntelligenceResult
     func polishBackground(_ transcript: String) async throws -> IntelligenceResult
     func revise(_ transcript: String, previousInput: String?, previousOutput: String?) async throws -> IntelligenceResult
+    func reviseStreaming(_ transcript: String, previousInput: String?, previousOutput: String?,
+                         onPartial: @escaping @Sendable (String) -> Void) async throws -> IntelligenceResult
 }
 
 public extension TranscriptIntelligence {
+    /// Streaming variant of `revise`. Defaults to the buffered path so existing
+    /// implementations and test doubles need no changes.
+    func reviseStreaming(_ transcript: String, previousInput: String?, previousOutput: String?,
+                         onPartial: @escaping @Sendable (String) -> Void) async throws -> IntelligenceResult {
+        try await revise(transcript, previousInput: previousInput, previousOutput: previousOutput)
+    }
+
     func polishBackground(_ transcript: String) async throws -> IntelligenceResult {
         try await polish(transcript)
     }
@@ -63,6 +80,19 @@ public extension TranscriptIntelligence {
 
 public protocol GeminiHTTPClient: Sendable {
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+    /// Byte stream for SSE responses. Defaults to buffering through `send`, so
+    /// existing clients and test doubles keep working unchanged.
+    func stream(_ request: URLRequest) async throws -> (AsyncThrowingStream<Data, any Error>, HTTPURLResponse)
+}
+
+public extension GeminiHTTPClient {
+    func stream(_ request: URLRequest) async throws -> (AsyncThrowingStream<Data, any Error>, HTTPURLResponse) {
+        let (data, response) = try await send(request)
+        return (AsyncThrowingStream { continuation in
+            continuation.yield(data)
+            continuation.finish()
+        }, response)
+    }
 }
 
 public struct URLSessionHTTPClient: GeminiHTTPClient {
@@ -79,13 +109,33 @@ public struct URLSessionHTTPClient: GeminiHTTPClient {
         }
         return (data, http)
     }
+
+    public func stream(_ request: URLRequest) async throws -> (AsyncThrowingStream<Data, any Error>, HTTPURLResponse) {
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw TranscriptionError("Invalid HTTP response.")
+        }
+        return (AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await line in bytes.lines {
+                        continuation.yield(Data((line + "\n").utf8))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }, http)
+    }
 }
 
 public func createTranscriptIntelligence(
     apiKey: String,
     model: String? = nil,
     httpClient: (any GeminiHTTPClient)? = nil,
-    patchEditing: Bool = false
+    patchEditing: Bool = true
 ) -> any TranscriptIntelligence {
     GeminiTranscriptIntelligence(
         apiKey: apiKey,
@@ -101,7 +151,7 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
     private let httpClient: any GeminiHTTPClient
     private let patchEditing: Bool
 
-    public init(apiKey: String, model: String? = nil, httpClient: any GeminiHTTPClient = URLSessionHTTPClient(), patchEditing: Bool = false) {
+    public init(apiKey: String, model: String? = nil, httpClient: any GeminiHTTPClient = URLSessionHTTPClient(), patchEditing: Bool = true) {
         self.patchEditing = patchEditing
         self.apiKey = apiKey
         self.model =
@@ -122,7 +172,7 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
 
     public func revise(_ transcript: String, previousInput: String?, previousOutput: String?) async throws -> IntelligenceResult {
         guard let previousInput, let previousOutput, !previousOutput.isEmpty else { return try await polish(transcript) }
-        if patchEditing, transcript.split(whereSeparator: { $0.isWhitespace }).count >= 160 {
+        if patchEditing, transcript.split(whereSeparator: { $0.isWhitespace }).count >= PATCH_EDITING_MINIMUM_WORDS {
             let document = TranscriptEditDocument(previousOutput)
             let payload: [String: Any] = [
                 "revision": document.revision,
@@ -151,7 +201,9 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
                 let fallback = try await polish(transcript)
                 return IntelligenceResult(text: fallback.text, model: fallback.model,
                     latencyMs: result.latencyMs + fallback.latencyMs,
-                    attempts: result.attempts + fallback.attempts, statuses: result.statuses + fallback.statuses)
+                    thoughtsTokens: result.thoughtsTokens + fallback.thoughtsTokens,
+                    attempts: result.attempts + fallback.attempts,
+                    statuses: result.statuses + fallback.statuses + [PATCH_FALLBACK_STATUS])
             }
         }
         let context: [String: String] = ["previousRawTranscript": previousInput,
@@ -166,7 +218,20 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
         """)
     }
 
-    private func generate(_ transcript: String, instruction: String, json: Bool = false, maximumAttempts: Int = MAX_ATTEMPTS) async throws -> IntelligenceResult {
+    public func reviseStreaming(_ transcript: String, previousInput: String?, previousOutput: String?,
+                                onPartial: @escaping @Sendable (String) -> Void) async throws -> IntelligenceResult {
+        let words = transcript.split(whereSeparator: { $0.isWhitespace }).count
+        // Patch mode emits JSON edit operations; streaming those to a preview
+        // would show the user raw syntax, so it stays buffered.
+        if patchEditing, previousOutput?.isEmpty == false, words >= PATCH_EDITING_MINIMUM_WORDS {
+            return try await revise(transcript, previousInput: previousInput, previousOutput: previousOutput)
+        }
+        return try await generate(transcript, instruction: TRANSCRIPT_INTELLIGENCE_SYSTEM_INSTRUCTION, onPartial: onPartial)
+    }
+
+    private func generate(_ transcript: String, instruction: String, json: Bool = false,
+                          maximumAttempts: Int = MAX_ATTEMPTS,
+                          onPartial: (@Sendable (String) -> Void)? = nil) async throws -> IntelligenceResult {
         let input = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         if input.isEmpty {
             return IntelligenceResult(text: "", model: model, latencyMs: 0, attempts: 0, statuses: [])
@@ -180,7 +245,11 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
         let encodedModel =
             model.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/")))
             ?? model
-        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):generateContent")!
+        // Streaming only when someone is watching the partials: a buffered
+        // response is simpler and finishes at the same time.
+        let streaming = onPartial != nil
+        let endpoint = streaming ? "streamGenerateContent?alt=sse" : "generateContent"
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):\(endpoint)")!
         var bodyObject: [String: Any] = [
             "systemInstruction": ["parts": [["text": instruction]]],
             "contents": [["role": "user", "parts": [["text": input]]]],
@@ -218,6 +287,41 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
                 request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
                 if attempt > 0 {
                     request.setValue("close", forHTTPHeaderField: "Connection")
+                }
+                if streaming, let onPartial {
+                    let (bytes, http) = try await httpClient.stream(request)
+                    statuses.append(http.statusCode)
+                    if (200..<300).contains(http.statusCode) {
+                        var accumulator = GeminiSSEAccumulator()
+                        for try await chunk in bytes {
+                            let delta = accumulator.accept(chunk)
+                            if !delta.isEmpty { onPartial(accumulator.text) }
+                        }
+                        if !accumulator.finish().isEmpty { onPartial(accumulator.text) }
+                        if accumulator.finishReason == "MAX_TOKENS" {
+                            throw TranscriptionError("Gemini intelligence truncated the polish (MAX_TOKENS).")
+                        }
+                        let text = accumulator.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !text.isEmpty else {
+                            throw TranscriptionError("Gemini intelligence returned no text.")
+                        }
+                        return IntelligenceResult(
+                            text: text, model: model,
+                            latencyMs: Int((Date().timeIntervalSince(startedAt) * 1000).rounded()),
+                            thoughtsTokens: accumulator.thoughtsTokens,
+                            attempts: max(1, statuses.count), statuses: statuses
+                        )
+                    }
+                    if !isRetryableStatus(http.statusCode) || attempt == maximumAttempts - 1 {
+                        throw IntelligenceHTTPError(
+                            status: http.statusCode, attempts: statuses.count,
+                            latencyMs: Int((Date().timeIntervalSince(startedAt) * 1000).rounded())
+                        )
+                    }
+                    lastError = TranscriptionError("Gemini intelligence request failed with HTTP \(http.statusCode).")
+                    response = nil
+                    try await Task.sleep(for: .milliseconds(retryDelayMs(response: nil, attempt: attempt)))
+                    continue
                 }
                 let result = try await httpClient.send(request)
                 response = result
@@ -269,7 +373,58 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
         }
 
         let latencyMs = Int((Date().timeIntervalSince(startedAt) * 1000).rounded())
-        return IntelligenceResult(text: text, model: model, latencyMs: latencyMs, attempts: max(1, statuses.count), statuses: statuses)
+        let thoughts = generateContentThoughtsTokens(payload)
+        return IntelligenceResult(text: text, model: model, latencyMs: latencyMs,
+            thoughtsTokens: thoughts, attempts: max(1, statuses.count), statuses: statuses)
+    }
+}
+
+/// Incremental `alt=sse` reader for `streamGenerateContent`. Each SSE frame is a
+/// full GenerateContentResponse whose candidate parts hold the next delta, so the
+/// accumulated text is the concatenation of every frame's parts.
+public struct GeminiSSEAccumulator {
+    public private(set) var text = ""
+    public private(set) var thoughtsTokens = 0
+    public private(set) var finishReason: String?
+    private var pending = ""
+
+    public init() {}
+
+    /// Feed raw bytes; returns the newly appended text, if any.
+    @discardableResult
+    public mutating func accept(_ chunk: Data) -> String {
+        pending += String(decoding: chunk, as: UTF8.self)
+        var appended = ""
+        while let newline = pending.firstIndex(of: "\n") {
+            let line = String(pending[pending.startIndex..<newline])
+            pending = String(pending[pending.index(after: newline)...])
+            appended += acceptLine(line)
+        }
+        return appended
+    }
+
+    /// Flush a final frame that arrived without a trailing newline.
+    @discardableResult
+    public mutating func finish() -> String {
+        let remainder = pending
+        pending = ""
+        return acceptLine(remainder)
+    }
+
+    private mutating func acceptLine(_ raw: String) -> String {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.hasPrefix("data:") else { return "" }
+        let payload = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
+        guard !payload.isEmpty, payload != "[DONE]",
+              let object = try? JSONSerialization.jsonObject(with: Data(payload.utf8))
+        else {
+            return ""
+        }
+        if let reason = generateContentFinishReason(object) { finishReason = reason }
+        thoughtsTokens = max(thoughtsTokens, generateContentThoughtsTokens(object))
+        let delta = extractGenerateContentText(object)
+        text += delta
+        return delta
     }
 }
 
@@ -294,6 +449,18 @@ private func retryDelayMs(response: HTTPURLResponse?, attempt: Int) -> UInt64 {
         base = max(base, min(UInt64(seconds) * 1000, 4000))
     }
     return base
+}
+
+/// thinkingBudget 0 should make this always 0. Surfaced so a silent regression
+/// (or a model that ignores the budget) shows up in the log instead of only as
+/// unexplained latency.
+private func generateContentThoughtsTokens(_ payload: Any) -> Int {
+    guard let object = payload as? [String: Any],
+          let usage = object["usageMetadata"] as? [String: Any]
+    else {
+        return 0
+    }
+    return usage["thoughtsTokenCount"] as? Int ?? 0
 }
 
 private func generateContentFinishReason(_ payload: Any) -> String? {

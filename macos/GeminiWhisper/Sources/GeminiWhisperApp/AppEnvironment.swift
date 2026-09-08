@@ -8,7 +8,8 @@ struct AppEnvironment: Sendable {
     var audioDevice: String
     var stopTailMs: Int
     var intelligenceModel: String?
-    var patchEditing: Bool
+    /// nil when unset: patch editing defaults on and .env may force a value.
+    var patchEditingOverride: Bool?
     /// nil when unset: the Settings toggle owns this unless .env forces a value.
     var optimisticPasteOverride: Bool?
     var envFileURL: URL?
@@ -39,7 +40,10 @@ struct AppEnvironment: Sendable {
             audioDevice: value("GEMINI_WHISPER_AUDIO_DEVICE", default: defaultAudioDevice),
             stopTailMs: max(0, stopTail),
             intelligenceModel: model.isEmpty ? nil : model,
-            patchEditing: value("GEMINI_WHISPER_PATCH_EDITING") == "1",
+            patchEditingOverride: {
+                let raw = value("GEMINI_WHISPER_PATCH_EDITING")
+                return raw.isEmpty ? nil : raw == "1"
+            }(),
             optimisticPasteOverride: {
                 let raw = value("GEMINI_WHISPER_OPTIMISTIC_PASTE")
                 return raw.isEmpty ? nil : raw == "1"

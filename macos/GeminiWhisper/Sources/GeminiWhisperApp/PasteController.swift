@@ -13,7 +13,12 @@ enum PasteController {
     private static let keyCodeCommand: CGKeyCode = 0x37
     /// kVK_LeftArrow
     private static let keyCodeLeftArrow: CGKeyCode = 0x7B
-    private static let pasteboardSettleNanoseconds: UInt64 = 50_000_000
+    /// Floor before Cmd+V: the readback below proves *our* view of the pasteboard,
+    /// but the target process still has to observe the change. Kept small and
+    /// polled up to the cap instead of always paying the worst case.
+    private static let pasteboardSettleFloorNanoseconds: UInt64 = 8_000_000
+    private static let pasteboardSettleCapNanoseconds: UInt64 = 50_000_000
+    private static let pasteboardPollNanoseconds: UInt64 = 2_000_000
     private static let pasteConsumeNanoseconds: UInt64 = 400_000_000
 
     static var executableURL: URL {
@@ -89,10 +94,9 @@ enum PasteController {
             AppLog.line("Paste clipboard write failed")
             throw PasteError.failed("Could not write the transcript to the clipboard.")
         }
-        AppLog.line("Paste clipboard written (\(text.count) chars); settling 50ms")
-
         do {
-            try await Task.sleep(nanoseconds: pasteboardSettleNanoseconds)
+            let settledNs = try await awaitPasteboardSettled(text, on: pasteboard)
+            AppLog.line("Paste clipboard written (\(text.count) chars); settled in \(settledNs / 1_000_000)ms")
             try postCommandV()
             // If Accessibility is still false the HID events were likely
             // dropped: keep the transcript on the clipboard so Cmd+V works
@@ -151,7 +155,7 @@ enum PasteController {
             throw PasteError.failed("Could not write the polished transcript to the clipboard.")
         }
         do {
-            try await Task.sleep(nanoseconds: pasteboardSettleNanoseconds)
+            _ = try await awaitPasteboardSettled(text, on: pasteboard)
             try postShiftLeftArrow(times: count)
             try postCommandV()
             AppLog.line("Repair replaced \(count) characters with \(text.count); clipboard restore scheduled")
@@ -165,6 +169,19 @@ enum PasteController {
             AppLog.line("Repair failed: \(error.localizedDescription)")
             throw error
         }
+    }
+
+    /// Sleep the floor, then poll until the write reads back, up to the cap.
+    /// Returns the nanoseconds actually waited.
+    private static func awaitPasteboardSettled(_ text: String, on pasteboard: NSPasteboard) async throws -> UInt64 {
+        try await Task.sleep(nanoseconds: pasteboardSettleFloorNanoseconds)
+        var waited = pasteboardSettleFloorNanoseconds
+        while waited < pasteboardSettleCapNanoseconds {
+            if pasteboard.string(forType: .string) == text { return waited }
+            try await Task.sleep(nanoseconds: pasteboardPollNanoseconds)
+            waited += pasteboardPollNanoseconds
+        }
+        return waited
     }
 
     private static func postShiftLeftArrow(times: Int) throws {

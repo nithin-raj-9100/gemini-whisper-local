@@ -433,7 +433,7 @@ public final class DictationSession: @unchecked Sendable {
             case .success(let value):
                 completedCandidate = (input, value)
                 polishCompletions += 1
-                options.emit(.warning(code: "polish_call", message: "polish kind=background revision=\(revision) ms=\(value.latencyMs) sessStarts=\(polishStarts) sessDone=\(polishCompletions)"))
+                options.emit(.warning(code: "polish_call", message: "polish kind=background revision=\(revision) ms=\(value.latencyMs) thoughts=\(value.thoughtsTokens) sessStarts=\(polishStarts) sessDone=\(polishCompletions)"))
                 // Carry the actual source, never relabel old work with the newest draft.
                 if input == draft {
                     options.emit(.polished(text: value.text, model: value.model, latencyMs: value.latencyMs, speculative: true, source: input))
@@ -487,7 +487,15 @@ public final class DictationSession: @unchecked Sendable {
                     } else {
                         lock.withLock { polishStarts += 1; finalJobs += 1 }
                         outcome = "fresh"
-                        result = try await intelligence.revise(input, previousInput: candidate?.input, previousOutput: candidate?.result.text)
+                        let sessionRef = self
+                        result = try await intelligence.reviseStreaming(
+                            input, previousInput: candidate?.input, previousOutput: candidate?.result.text
+                        ) { partial in
+                            sessionRef.lock.withLock {
+                                guard !sessionRef.discarded else { return }
+                                sessionRef.options.emit(.polishProgress(text: partial))
+                            }
+                        }
                     }
                 } catch { failure = error; outcome = "raw_failure" }
             }
@@ -497,7 +505,7 @@ public final class DictationSession: @unchecked Sendable {
                 guard input == draft else { return false }
                 if let result {
                     if !reused { polishCompletions += 1 }
-                    options.emit(.warning(code: "polish_call", message: "polish kind=\(reused ? "reused" : "final") revision=\(revision) chars=\(input.count) ms=\(result.latencyMs) attempts=\(result.attempts) statuses=\(result.statuses) sessStarts=\(polishStarts) sessDone=\(polishCompletions) sessCancelled=\(polishCancels)"))
+                    options.emit(.warning(code: "polish_call", message: "polish kind=\(reused ? "reused" : "final") revision=\(revision) chars=\(input.count) ms=\(result.latencyMs) thoughts=\(result.thoughtsTokens) attempts=\(result.attempts) statuses=\(result.statuses) sessStarts=\(polishStarts) sessDone=\(polishCompletions) sessCancelled=\(polishCancels)"))
                     completedCandidate = (input, result)
                     options.emit(.polished(text: result.text, model: result.model, latencyMs: result.latencyMs, speculative: reused ? true : nil, source: input))
                 } else if let failure {

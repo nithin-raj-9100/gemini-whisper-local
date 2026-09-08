@@ -231,7 +231,7 @@ final class DictationController {
                 apiKey: apiKey,
                 config: config,
                 intelligenceModel: settings.environment.intelligenceModel,
-                patchEditing: settings.environment.patchEditing
+                patchEditing: settings.environment.patchEditingOverride ?? true
             ) { [weak self] event in
                 DispatchQueue.main.async {
                     self?.handle(event, generation: generation)
@@ -342,6 +342,12 @@ final class DictationController {
             }
         case .provisional:
             handleProvisional(event.text, generation: generation)
+        case .polishProgress:
+            // Preview only: never feeds draftText(), so a partial stream can
+            // never be the text that gets pasted.
+            guard phase == .finalizing, !event.text.isEmpty else { return }
+            hud.updateText(event.text)
+            hud.updateStatus("Polishing…")
         case .timing:
             pipelineTiming = event.timing
             if event.timing?.outcome.hasPrefix("raw_") == true {

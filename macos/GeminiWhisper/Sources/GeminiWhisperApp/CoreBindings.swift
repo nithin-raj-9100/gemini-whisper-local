@@ -74,6 +74,7 @@ struct AppTranscriptEvent: Sendable {
         case final
         case polished
         case provisional
+        case polishProgress
         case warning
         case timing
         case complete
@@ -121,6 +122,8 @@ func adaptServerEvent(_ event: ServerEvent) -> AppTranscriptEvent {
         )
     case .provisional(let text):
         return makeEvent(kind: .provisional, text: text)
+    case .polishProgress(let text):
+        return makeEvent(kind: .polishProgress, text: text)
     case .warning(let code, let message):
         return makeEvent(kind: .warning, code: code, message: AppLog.redact(message))
     case .timing(let timing):
@@ -172,7 +175,7 @@ final class CoreDictationBox: @unchecked Sendable {
         apiKey: String,
         config: TranscriptionConfig,
         intelligenceModel: String?,
-        patchEditing: Bool = false,
+        patchEditing: Bool = true,
         emit: @escaping (AppTranscriptEvent) -> Void
     ) {
         let intelligence: (any TranscriptIntelligence)? =

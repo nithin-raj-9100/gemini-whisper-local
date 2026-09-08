@@ -93,6 +93,8 @@ public enum ServerEvent: Sendable, Equatable {
     /// Raw transcript is final but polish is still running. Consumers that can
     /// correct already-inserted text may deliver this now and repair later.
     case provisional(text: String)
+    /// Partial polished text while the final call streams. Preview only.
+    case polishProgress(text: String)
     case warning(code: String, message: String)
     case timing(DictationTiming)
     case complete
@@ -112,6 +114,7 @@ public enum ServerEvent: Sendable, Equatable {
         case .final: return "final"
         case .polished: return "polished"
         case .provisional: return "provisional"
+        case .polishProgress: return "polish-progress"
         case .warning: return "warning"
         case .timing: return "timing"
         case .complete: return "complete"
@@ -126,15 +129,19 @@ public struct IntelligenceResult: Sendable, Equatable {
     public var text: String
     public var model: String
     public var latencyMs: Int
+    /// Thinking tokens the model actually billed. Must stay 0: thinkingBudget is
+    /// set to 0 and a non-zero value here means the request silently reasoned.
+    public var thoughtsTokens: Int = 0
     /// HTTP attempts made for this call (0 when no request was sent).
     public var attempts: Int
     /// Per-attempt HTTP status codes (-1 for transport errors).
     public var statuses: [Int]
 
-    public init(text: String, model: String, latencyMs: Int, attempts: Int = 1, statuses: [Int] = []) {
+    public init(text: String, model: String, latencyMs: Int, thoughtsTokens: Int = 0, attempts: Int = 1, statuses: [Int] = []) {
         self.text = text
         self.model = model
         self.latencyMs = latencyMs
+        self.thoughtsTokens = thoughtsTokens
         self.attempts = attempts
         self.statuses = statuses
     }
