@@ -120,6 +120,10 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     private var state: State = .idle
     private var queuedAudio: [Data] = []
     private var queuedBytes = 0
+    private var localEndpoint = LocalSpeechEndpoint()
+    private var hybridEndPending = false
+    private var audioSequence = 0
+    private var hybridEndSequence = 0
     private var connectContinuation: CheckedContinuation<Void, Error>?
     private var failureReported = false
     private var completeEmitted = false
@@ -131,7 +135,6 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     private var interimAccumulator = InterimTranscriptAccumulator()
     private var lastFinal = ""
     private var hasTranscript = false
-    private var fastFinishGraceElapsed = false
     private var connectTimeoutTask: Task<Void, Never>?
     private var finishTimeoutTask: Task<Void, Never>?
     private var sessionTimeoutTask: Task<Void, Never>?
@@ -214,8 +217,11 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         }
         state = .finishing
         options.emit(.speechEnd)
-        if options.config.vad != .manual,
-           lastAudioSentAt == 0 || lastTurnCompleteAt - lastAudioSentAt > RACE_WINDOW_MS
+        // Nothing pending: the server already turned everything after the last
+        // audio frame (or no audio was sent). Complete locally instead of a
+        // network round trip. Applies to manual push-to-talk too: an
+        // activityEnd acknowledging already-finalized audio buys nothing.
+        if !hybridEndPending && (lastAudioSentAt == 0 || lastTurnCompleteAt - lastAudioSentAt > RACE_WINDOW_MS)
         {
             emitComplete()
             close()
@@ -225,7 +231,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             options.config.vad == .manual
                 ? ["activityEnd": [String: Any]()]
                 : ["audioStreamEnd": true]
-        try sendJSON(["realtimeInput": realtimeInput])
+        if !hybridEndPending { try sendJSON(["realtimeInput": realtimeInput]) }
         finishTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(FAST_FINISH_GRACE_MS))
             guard !Task.isCancelled else { return }
@@ -247,6 +253,8 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     }
 
     private func openSocket() {
+        hybridEndPending = false
+        localEndpoint = LocalSpeechEndpoint()
         let encodedKey =
             options.apiKey.addingPercentEncoding(withAllowedCharacters: encodeURIComponentAllowed) ?? options.apiKey
         let url = URL(string: "\(GEMINI_LIVE_ENDPOINT)?key=\(encodedKey)")!
@@ -345,6 +353,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         }
 
         for event in parseGeminiMessage(parsed) {
+            if state == .closed { break }
             if event.typeName == "ready" {
                 onReady()
                 options.emit(event)
@@ -362,10 +371,21 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             if event.typeName == "complete" {
                 commitInterimFallback()
                 lastTurnCompleteAt = nowMilliseconds()
-                // Mid-session turnComplete is a VAD turn, not dictation complete.
+                let acknowledgedHybridEnd = hybridEndPending
+                hybridEndPending = false
+                if options.config.vad == .hybrid {
+                    lastFinal = ""
+                    options.emit(.turnBoundary)
+                }
                 if state == .finishing {
-                    emitComplete()
-                    close()
+                    if acknowledgedHybridEnd, audioSequence > hybridEndSequence {
+                        // An older pause finished while Stop was draining newer PCM.
+                        // Only a subsequent acknowledgment may complete that newer audio.
+                        try? sendJSON(["realtimeInput": ["audioStreamEnd": true]])
+                    } else {
+                        emitComplete()
+                        close()
+                    }
                 }
                 continue
             }
@@ -373,28 +393,30 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                 let merged = interimAccumulator.accept(text)
                 latestInterim = merged
                 options.emit(.interim(text: merged))
-                if state == .finishing,
-                   fastFinishGraceElapsed,
-                   commitInterimFallback()
-                {
-                    options.emit(.warning(
-                        code: "finalization_ack_timeout",
-                        message: "Gemini did not acknowledge finalization; using its latest buffered transcript."
-                    ))
-                    emitComplete()
-                    close()
-                }
                 continue
             }
             if case .final(let text) = event {
                 let accumulated = interimAccumulator.text
-                let fullText = joinUniqueTranscript(accumulated, text)
+                let fullText = isRevisionReplacement(last: accumulated, incoming: text)
+                    ? text : joinUniqueTranscript(accumulated, text)
                 interimAccumulator.reset()
                 latestInterim = ""
+                // Drop server resends of text already delivered: without this,
+                // Session/Controller append a second copy of the same chunk.
+                let normNew = normalizeTranscript(fullText)
+                let normLast = normalizeTranscript(lastFinal)
+                if !normNew.isEmpty, !normLast.isEmpty, normNew == normLast || normLast.contains(normNew) {
+                    hasTranscript = true
+                    if state == .finishing, !hybridEndPending {
+                        emitComplete()
+                        close()
+                    }
+                    continue
+                }
                 lastFinal = fullText
                 hasTranscript = true
                 options.emit(.final(text: fullText))
-                if state == .finishing {
+                if state == .finishing, !hybridEndPending {
                     emitComplete()
                     close()
                 }
@@ -450,6 +472,13 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                 ],
             ],
         ])
+        audioSequence += 1
+        if options.config.vad == .hybrid, state == .ready,
+           localEndpoint.accept(chunk), !hybridEndPending {
+            try sendJSON(["realtimeInput": ["audioStreamEnd": true]])
+            hybridEndPending = true
+            hybridEndSequence = audioSequence
+        }
     }
 
     private func queueAudio(_ chunk: Data) throws {
@@ -489,7 +518,12 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         let text = latestInterim.trimmingCharacters(in: .whitespacesAndNewlines)
         interimAccumulator.reset()
         latestInterim = ""
-        if text.isEmpty || normalizeTranscript(text) == normalizeTranscript(lastFinal) {
+        let normText = normalizeTranscript(text)
+        let normLast = normalizeTranscript(lastFinal)
+        // Echo guard: never promote interim the session already holds as a
+        // final (exact or contained). Otherwise the fallback + the real final
+        // land as two copies of the same words on stop.
+        if text.isEmpty || normText == normLast || (!normLast.isEmpty && normLast.contains(normText)) {
             return false
         }
         lastFinal = text
@@ -529,19 +563,8 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
 
     private func handleFastFinishGrace() {
         guard state == .finishing, !completeEmitted else { return }
-        let recoveredInterim = commitInterimFallback()
-        if hasTranscript {
-            options.emit(.warning(
-                code: "finalization_ack_timeout",
-                message: recoveredInterim
-                    ? "Gemini did not acknowledge finalization; using its latest buffered transcript."
-                    : "Gemini did not acknowledge finalization; using the transcript already received."
-            ))
-            emitComplete()
-            close()
-            return
-        }
-        fastFinishGraceElapsed = true
+        // An interim is not an acknowledgment that the server processed the last audio.
+        options.emit(.warning(code: "finalization_wait", message: "Still waiting for final audio acknowledgment."))
     }
 
     private func handleHardFinishTimeout() {

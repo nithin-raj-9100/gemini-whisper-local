@@ -41,6 +41,8 @@ struct PcmMetrics: Sendable {
 /// Persistent `AVAudioEngine` tap converted to 16 kHz Int16 mono, from `macos/audio-helper/main.swift`.
 final class MicrophoneCapture: @unchecked Sendable {
     private let engine = AVAudioEngine()
+    private let conversionLock = NSLock()
+    private var acceptingAudio = false
     private var converter: AVAudioConverter?
     private var outputFormat: AVAudioFormat?
     private var reportedConversionError = false
@@ -48,6 +50,7 @@ final class MicrophoneCapture: @unchecked Sendable {
     private let lock = NSLock()
     private var onPCM: ((Data) -> Void)?
     private var diagnosticBuffer: [Data]?
+    private var lastDevicePreference: String?
 
     var isRunning: Bool { engine.isRunning }
 
@@ -58,6 +61,7 @@ final class MicrophoneCapture: @unchecked Sendable {
     }
 
     func prepare() throws {
+        guard !tapInstalled else { return }
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
@@ -82,12 +86,19 @@ final class MicrophoneCapture: @unchecked Sendable {
             try prepare()
         }
         guard !engine.isRunning else { return }
+        conversionLock.withLock { acceptingAudio = true }
         try engine.start()
     }
 
     func pause() {
-        if engine.isRunning {
-            engine.pause()
+        if engine.isRunning { engine.pause() }
+        // Wait for any conversion already executing, including its PCM handoff.
+        // Later callbacks belong beyond this explicit boundary and are ignored.
+        conversionLock.withLock {
+            guard acceptingAudio else { return }
+            acceptingAudio = false
+            flushConverterTail()
+            converter?.reset()
         }
     }
 
@@ -151,7 +162,17 @@ final class MicrophoneCapture: @unchecked Sendable {
     }
 
     /// Select an input by `AVCaptureDevice.uniqueID`. Empty / `:0` / `default` uses the system default.
+    /// No-op when the preference is unchanged: reinstalling the tap and
+    /// re-priming the converter every toggle risks dropping leading frames.
     func applyPreferredDevice(uniqueID: String) {
+        let normalized = AudioDeviceList.normalizedPreference(uniqueID)
+        lock.lock()
+        let unchanged = normalized == lastDevicePreference
+        lock.unlock()
+        if unchanged, tapInstalled { return }
+        lock.lock()
+        lastDevicePreference = normalized
+        lock.unlock()
         resetTap()
         if AudioDeviceList.isSystemDefaultPreference(uniqueID) {
             let defaultID = AudioDeviceList.defaultInputDeviceID()
@@ -200,6 +221,9 @@ final class MicrophoneCapture: @unchecked Sendable {
     }
 
     private func convert(buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat) {
+        conversionLock.lock()
+        defer { conversionLock.unlock() }
+        guard acceptingAudio else { return }
         guard let outputFormat, let converter else { return }
         let estimatedFrames = ceil(Double(buffer.frameLength) * 16_000 / inputFormat.sampleRate) + 8
         guard let converted = AVAudioPCMBuffer(
@@ -228,7 +252,28 @@ final class MicrophoneCapture: @unchecked Sendable {
             return
         }
         guard converted.frameLength > 0, let samples = converted.int16ChannelData?[0] else { return }
-        let data = Data(bytes: samples, count: Int(converted.frameLength) * MemoryLayout<Int16>.size)
+        deliver(Data(bytes: samples, count: Int(converted.frameLength) * MemoryLayout<Int16>.size))
+    }
+
+    /// Drain resampler history as well as the application's PCM chunker.
+    /// Called with conversionLock held, after the input engine has paused.
+    private func flushConverterTail() {
+        guard let converter, let outputFormat else { return }
+        for _ in 0..<8 {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 1024) else { return }
+            var error: NSError?
+            let status = converter.convert(to: buffer, error: &error) { _, inputStatus in
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            if buffer.frameLength > 0, let samples = buffer.int16ChannelData?[0] {
+                deliver(Data(bytes: samples, count: Int(buffer.frameLength) * 2))
+            }
+            if status == .endOfStream || status == .error || buffer.frameLength == 0 { return }
+        }
+    }
+
+    private func deliver(_ data: Data) {
         lock.lock()
         diagnosticBuffer?.append(data)
         let handler = onPCM

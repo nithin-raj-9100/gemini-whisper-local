@@ -69,10 +69,12 @@ struct AppTranscriptEvent: Sendable {
         case ready
         case speechStart
         case speechEnd
+        case turnBoundary
         case interim
         case final
         case polished
         case warning
+        case timing
         case complete
         case cancelled
         case error
@@ -80,7 +82,9 @@ struct AppTranscriptEvent: Sendable {
     }
 
     var kind: Kind
+    var timing: DictationTiming?
     var text: String
+    var source: String
     var model: String
     var latencyMs: Int
     var speculative: Bool
@@ -99,20 +103,25 @@ func adaptServerEvent(_ event: ServerEvent) -> AppTranscriptEvent {
         return makeEvent(kind: .speechStart)
     case .speechEnd:
         return makeEvent(kind: .speechEnd)
+    case .turnBoundary:
+        return makeEvent(kind: .turnBoundary)
     case .interim(let text):
         return makeEvent(kind: .interim, text: text)
     case .final(let text):
         return makeEvent(kind: .final, text: text)
-    case .polished(let text, let model, let latencyMs, let speculative):
+    case .polished(let text, let model, let latencyMs, let speculative, let source):
         return makeEvent(
             kind: .polished,
             text: text,
+            source: source,
             model: model,
             latencyMs: latencyMs,
             speculative: speculative ?? false
         )
     case .warning(let code, let message):
         return makeEvent(kind: .warning, code: code, message: AppLog.redact(message))
+    case .timing(let timing):
+        return makeEvent(kind: .timing, timing: timing)
     case .complete:
         return makeEvent(kind: .complete)
     case .cancelled:
@@ -126,7 +135,9 @@ func adaptServerEvent(_ event: ServerEvent) -> AppTranscriptEvent {
 
 private func makeEvent(
     kind: AppTranscriptEvent.Kind,
+    timing: DictationTiming? = nil,
     text: String = "",
+    source: String = "",
     model: String = "",
     latencyMs: Int = 0,
     speculative: Bool = false,
@@ -136,7 +147,9 @@ private func makeEvent(
 ) -> AppTranscriptEvent {
     AppTranscriptEvent(
         kind: kind,
+        timing: timing,
         text: text,
+        source: source,
         model: model,
         latencyMs: latencyMs,
         speculative: speculative,
@@ -156,10 +169,11 @@ final class CoreDictationBox: @unchecked Sendable {
         apiKey: String,
         config: TranscriptionConfig,
         intelligenceModel: String?,
+        patchEditing: Bool = false,
         emit: @escaping (AppTranscriptEvent) -> Void
     ) {
         let intelligence: (any TranscriptIntelligence)? =
-            config.polish ? createTranscriptIntelligence(apiKey: apiKey, model: intelligenceModel) : nil
+            config.polish ? createTranscriptIntelligence(apiKey: apiKey, model: intelligenceModel, patchEditing: patchEditing) : nil
         session = DictationSession(
             apiKey: apiKey,
             config: config,
@@ -187,6 +201,8 @@ final class CoreDictationBox: @unchecked Sendable {
             try session.sendAudio(tail)
         }
     }
+
+    func prepareToStop(at time: TimeInterval) { session.prepareToStop(at: time) }
 
     func stop() throws {
         try session.stop()

@@ -39,6 +39,11 @@ final class AppRuntime {
             try? LoginItemController.setEnabled(true)
         }
 
+        HotkeyMonitor.shared.onPrepare = { [weak controller] in controller?.prepareHotkeyCapture() }
+        HotkeyMonitor.shared.onDiscardPreparation = { [weak controller] in controller?.discardHotkeyCapture() }
+        HotkeyMonitor.shared.onHoldStart = { [weak controller] in controller?.beginHeldDictation() }
+        HotkeyMonitor.shared.onHoldEnd = { [weak controller] in controller?.finishHeldDictation() }
+        HotkeyMonitor.shared.onHoldCancel = { [weak controller] in controller?.cancelHeldDictation() }
         HotkeyMonitor.shared.onToggle = { [weak controller] in
             controller?.toggle()
         }

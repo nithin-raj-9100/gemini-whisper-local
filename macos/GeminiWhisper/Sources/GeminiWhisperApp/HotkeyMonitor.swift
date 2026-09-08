@@ -3,26 +3,36 @@ import Carbon
 import Cocoa
 import CoreGraphics
 import Darwin
+import GeminiWhisperCore
 
 nonisolated(unsafe) private var hotkeyEventTapPort: CFMachPort?
 
-/// Left and Right Option taps (≤0.6s, not interrupted, 350ms debounce) plus Escape cancel.
+/// Right Option tap toggles; holding for 0.6s records until release. Escape cancels.
+/// Left Option is intentionally ignored.
 /// Mirrors `macos/audio-helper/main.swift`: Carbon hotkey + NSEvent monitors + CGEventTap.
 final class HotkeyMonitor: @unchecked Sendable {
     static let shared = HotkeyMonitor()
 
+    var onPrepare: (() -> Void)?
+    var onDiscardPreparation: (() -> Void)?
+    var onHoldStart: (() -> Void)?
+    var onHoldEnd: (() -> Void)?
+    var onHoldCancel: (() -> Void)?
     var onToggle: (() -> Void)?
     var onCancel: (() -> Void)?
     private(set) var eventTapInstalled = false
     private(set) var eventTapFailureMessage: String?
 
     private let kVKRightOption: UInt16 = 61
-    private let kVKLeftOption: UInt16 = 58
     private let kVKEscape: UInt16 = 53
 
     private var lastToggleTriggerTime: UInt64 = 0
     private var optionPressTime: UInt64 = 0
-    private var hotkeyInterrupted = false
+    /// Down-stroke time of the last completed tap (mach_absolute_time).
+    /// Lets the stop-to-paste metric also report press-down → paste (felt latency).
+    private(set) var lastTapDownTime: UInt64 = 0
+    private var gesture = OptionKeyGesture()
+    private var holdTask: Task<Void, Never>?
     private var escapeHotKeyRef: EventHotKeyRef?
     private let escapeHotKeyID = EventHotKeyID(signature: OSType(0x47574553), id: 1)
     private var globalEventTap: CFMachPort? {
@@ -44,6 +54,9 @@ final class HotkeyMonitor: @unchecked Sendable {
     }
 
     func stop() {
+        interruptGesture()
+        gesture = OptionKeyGesture()
+        optionPressTime = 0
         unregisterEscapeHotKey()
         if let tap = globalEventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -90,33 +103,64 @@ final class HotkeyMonitor: @unchecked Sendable {
     }
 
     fileprivate func handleEscapeKey() {
+        interruptGesture()
         unregisterEscapeHotKey()
         onCancel?()
     }
 
     fileprivate func handleModifierChange(keyCode: UInt16, isOptionDown: Bool) {
-        if keyCode == kVKRightOption || keyCode == kVKLeftOption {
+        if keyCode == kVKRightOption {
             if isOptionDown {
+                let actions = gesture.press(at: ProcessInfo.processInfo.systemUptime)
+                guard !actions.isEmpty else { return } // duplicate event-tap/NSEvent delivery
                 optionPressTime = mach_absolute_time()
-                hotkeyInterrupted = false
-            } else if optionPressTime > 0 {
-                let duration = timeIntervalSinceAbsoluteTime(optionPressTime)
-                if !hotkeyInterrupted && duration <= 0.6 {
-                    triggerDictationToggle()
+                holdTask = Task { @MainActor [weak self] in
+                    do { try await Task.sleep(for: .milliseconds(600)) } catch { return }
+                    guard let self, !Task.isCancelled else { return }
+                    let actions = self.gesture.advance(to: ProcessInfo.processInfo.systemUptime)
+                    self.perform(actions)
                 }
+                perform(actions)
+            } else {
+                holdTask?.cancel()
+                holdTask = nil
+                perform(gesture.release(at: ProcessInfo.processInfo.systemUptime))
+                onDiscardPreparation?()
                 optionPressTime = 0
-                hotkeyInterrupted = false
             }
         } else if optionPressTime > 0 {
-            hotkeyInterrupted = true
+            interruptGesture()
         }
+    }
+
+    private func perform(_ actions: [OptionKeyGesture.Action]) {
+        for action in actions {
+            switch action {
+            case .prepare: onPrepare?()
+            case .toggle:
+                lastTapDownTime = optionPressTime
+                triggerDictationToggle()
+            case .startHold:
+                lastTapDownTime = optionPressTime
+                onHoldStart?()
+            case .finishHold: onHoldEnd?()
+            case .discardPreparation: onDiscardPreparation?()
+            case .cancelHold: onHoldCancel?()
+            }
+        }
+    }
+
+    private func interruptGesture() {
+        holdTask?.cancel()
+        holdTask = nil
+        perform(gesture.interrupt())
     }
 
     fileprivate func noteKeyDown(keyCode: UInt16) {
         if keyCode == kVKEscape {
             handleEscapeKey()
         } else if optionPressTime > 0 {
-            hotkeyInterrupted = true
+            interruptGesture()
         }
     }
 
@@ -145,11 +189,8 @@ final class HotkeyMonitor: @unchecked Sendable {
         }
 
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == self?.kVKEscape {
-                self?.handleEscapeKey()
-                return nil
-            }
-            return event
+            self?.noteKeyDown(keyCode: event.keyCode)
+            return event.keyCode == self?.kVKEscape ? nil : event
         }
     }
 

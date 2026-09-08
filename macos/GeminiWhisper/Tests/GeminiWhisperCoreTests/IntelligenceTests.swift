@@ -4,6 +4,40 @@ import Testing
 
 @Suite("transcript intelligence")
 struct IntelligenceTests {
+    @Test func revisionGetsWholeContextAndCanChangeEarlierSentences() async throws {
+        let intelligence = GeminiTranscriptIntelligence(apiKey: "test-only", httpClient: ClosureHTTPClient { request in
+            let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+            let contents = body["contents"] as! [[String: Any]]
+            let parts = contents[0]["parts"] as! [[String: String]]
+            let context = try JSONSerialization.jsonObject(with: Data(parts[0]["text"]!.utf8)) as! [String: String]
+            #expect(context["previousCandidate"] == "Set the timeout to 15 seconds.")
+            #expect(context["currentRawTranscript"] == "set timeout to fifteen seconds actually make that fifty")
+            let response: [String: Any] = ["candidates": [["content": ["parts": [["text": "Set the timeout to 50 seconds."]]]]]]
+            return (try JSONSerialization.data(withJSONObject: response), 200)
+        })
+        let result = try await intelligence.revise("set timeout to fifteen seconds actually make that fifty",
+            previousInput: "set timeout to fifteen seconds", previousOutput: "Set the timeout to 15 seconds.")
+        #expect(result.text == "Set the timeout to 50 seconds.")
+    }
+
+    @Test func invalidPatchFallsBackToCompleteCurrentTranscript() async throws {
+        nonisolated(unsafe) var calls = 0
+        let raw = String(repeating: "word ", count: 170) + "last words"
+        let intelligence = GeminiTranscriptIntelligence(apiKey: "test-only", httpClient: ClosureHTTPClient { request in
+            calls += 1
+            let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+            let config = body["generationConfig"] as! [String: Any]
+            if calls == 1 { #expect(config["responseMimeType"] as? String == "application/json") }
+            let text = calls == 1 ? #"{"revision":"wrong","edits":[]}"# : raw
+            let response: [String: Any] = ["candidates": [["content": ["parts": [["text": text]]]]]]
+            return (try JSONSerialization.data(withJSONObject: response), 200)
+        }, patchEditing: true)
+        let result = try await intelligence.revise(raw, previousInput: "earlier words", previousOutput: "Earlier words.")
+        #expect(calls == 2)
+        #expect(result.text == raw)
+        #expect(result.attempts == 2)
+    }
+
     @Test func usesFlashLiteWithMinimalThinkingAndReturnsOnlyModelText() async throws {
         nonisolated(unsafe) var requestURL = ""
         nonisolated(unsafe) var request: URLRequest?
@@ -42,6 +76,8 @@ struct IntelligenceTests {
         #expect((parts[0]["text"] as? String)?.contains("never summarize, generalize") == true)
         #expect(result.text == "1. Milk\n2. Vegetables")
         #expect(result.model == "gemini-3.5-flash-lite")
+        #expect(result.attempts == 1)
+        #expect(result.statuses == [200])
         #expect(TRANSCRIPT_INTELLIGENCE_SYSTEM_INSTRUCTION.contains("ALWAYS format the items"))
     }
 
@@ -89,10 +125,36 @@ struct IntelligenceTests {
         let result = try await intelligence.polish("raw text")
         #expect(attempts == 2)
         #expect(result.text == "After retry")
+        #expect(result.attempts == 2)
+        #expect(result.statuses == [429, 200])
     }
 
-    @Test func returnsEmptyResultForEmptyTranscript() async throws {
-        nonisolated(unsafe) var attempts = 0
+    @Test func throwsWhenOutputIsTruncatedByTokenCap() async throws {
+        let intelligence = createTranscriptIntelligence(
+            apiKey: "test-only",
+            httpClient: ClosureHTTPClient { _ in
+                let body: [String: Any] = [
+                    "candidates": [
+                        [
+                            "content": ["parts": [["text": "partial polish"]]],
+                            "finishReason": "MAX_TOKENS",
+                        ],
+                    ],
+                ]
+                return (try JSONSerialization.data(withJSONObject: body), 200)
+            }
+        )
+
+        var threw = false
+        do {
+            _ = try await intelligence.polish("some transcript that would be cut off")
+        } catch {
+            threw = true
+        }
+        #expect(threw)
+    }
+
+    @Test func returnsEmptyResultForEmptyTranscript() async throws {        nonisolated(unsafe) var attempts = 0
         let intelligence = createTranscriptIntelligence(
             apiKey: "test-only",
             httpClient: ClosureHTTPClient { _ in

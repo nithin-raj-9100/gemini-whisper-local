@@ -8,6 +8,7 @@ struct AppEnvironment: Sendable {
     var audioDevice: String
     var stopTailMs: Int
     var intelligenceModel: String?
+    var patchEditing: Bool
     var envFileURL: URL?
 
     static let defaultLanguage = "en-IN"
@@ -36,6 +37,7 @@ struct AppEnvironment: Sendable {
             audioDevice: value("GEMINI_WHISPER_AUDIO_DEVICE", default: defaultAudioDevice),
             stopTailMs: max(0, stopTail),
             intelligenceModel: model.isEmpty ? nil : model,
+            patchEditing: value("GEMINI_WHISPER_PATCH_EDITING") == "1",
             envFileURL: fileURL
         )
     }
@@ -43,6 +45,14 @@ struct AppEnvironment: Sendable {
     /// Walk from the compiled source path, the .app bundle, and cwd until `.env` is found.
     private static func locateDotEnv() -> URL? {
         var candidates: [URL] = []
+
+        if let resourceURL = Bundle.main.resourceURL {
+            candidates.append(resourceURL.appendingPathComponent(".env"))
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        candidates.append(home.appendingPathComponent(".config/gemini-whisper/.env"))
+        candidates.append(home.appendingPathComponent(".gemini-whisper.env"))
 
         var sourceDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         for _ in 0..<10 {

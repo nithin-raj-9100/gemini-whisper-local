@@ -86,10 +86,12 @@ public enum ServerEvent: Sendable, Equatable {
     case ready
     case speechStart
     case speechEnd
+    case turnBoundary
     case interim(text: String)
     case final(text: String)
-    case polished(text: String, model: String, latencyMs: Int, speculative: Bool?)
+    case polished(text: String, model: String, latencyMs: Int, speculative: Bool?, source: String = "")
     case warning(code: String, message: String)
+    case timing(DictationTiming)
     case complete
     case cancelled
     case pong
@@ -102,10 +104,12 @@ public enum ServerEvent: Sendable, Equatable {
         case .ready: return "ready"
         case .speechStart: return "speech-start"
         case .speechEnd: return "speech-end"
+        case .turnBoundary: return "turn-boundary"
         case .interim: return "interim"
         case .final: return "final"
         case .polished: return "polished"
         case .warning: return "warning"
+        case .timing: return "timing"
         case .complete: return "complete"
         case .cancelled: return "cancelled"
         case .pong: return "pong"
@@ -118,11 +122,17 @@ public struct IntelligenceResult: Sendable, Equatable {
     public var text: String
     public var model: String
     public var latencyMs: Int
+    /// HTTP attempts made for this call (0 when no request was sent).
+    public var attempts: Int
+    /// Per-attempt HTTP status codes (-1 for transport errors).
+    public var statuses: [Int]
 
-    public init(text: String, model: String, latencyMs: Int) {
+    public init(text: String, model: String, latencyMs: Int, attempts: Int = 1, statuses: [Int] = []) {
         self.text = text
         self.model = model
         self.latencyMs = latencyMs
+        self.attempts = attempts
+        self.statuses = statuses
     }
 }
 
@@ -242,4 +252,27 @@ public func redactApiKeys(_ text: String) -> String {
 
 func nowMilliseconds() -> Double {
     ProcessInfo.processInfo.systemUptime * 1000
+}
+
+/// Status survives the HTTP layer so admission control need not parse error prose.
+public struct IntelligenceHTTPError: Error, Sendable, LocalizedError {
+    public let status: Int
+    public let attempts: Int
+    public let latencyMs: Int
+    public init(status: Int, attempts: Int = 1, latencyMs: Int = 0) {
+        self.status = status; self.attempts = attempts; self.latencyMs = latencyMs
+    }
+    public var errorDescription: String? { "Gemini intelligence request failed with HTTP \(status)." }
+}
+
+public struct DictationTiming: Sendable, Equatable {
+    public let sessionID: String
+    public let readyAt: TimeInterval
+    public let captureMs: Int
+    public let liveMs: Int
+    public let polishWaitMs: Int
+    public let outcome: String
+    public let backgroundJobs: Int
+    public let finalJobs: Int
+    public let liveFallback: Bool
 }

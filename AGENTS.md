@@ -42,7 +42,8 @@ Right Option ──► GeminiWhisper.app ──PCM16 16 kHz mono──► Gemini
 `DictationSession` (`Sources/GeminiWhisperCore`) talks to Gemini over a hand-written WebSocket
 (`GeminiLive.swift`). `DictationController` owns capture, session generation, paste, and HUD.
 `MicrophoneCapture` is a persistent `AVAudioEngine` tap. `HotkeyMonitor` uses a CGEvent tap plus
-NSEvent monitors for Option taps (≤0.6s, not used as a modifier) and Escape.
+NSEvent monitors for Option taps (under 0.6s toggles), holds (0.6s or longer records until
+release), and Escape. Using Option as a modifier cancels that gesture without pasting.
 
 The polish pass overlaps Live finalization (speculative Flash-Lite). If polish fails or times out,
 the raw transcript is inserted. Audio is chunked to 100 ms frames (3,200 bytes). The app can

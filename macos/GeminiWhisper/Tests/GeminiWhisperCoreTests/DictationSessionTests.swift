@@ -14,11 +14,11 @@ struct DictationSessionTests {
             }
         )
 
-        #expect(events.dropLast().last == .polished(
+        #expect(events.last(where: { $0.typeName == "polished" }) == .polished(
             text: "1. Milk\n2. Vegetables",
             model: "test-flash-lite",
             latencyMs: 3,
-            speculative: nil
+            speculative: nil, source: "Testing."
         ))
         #expect(events.last?.typeName == "complete")
     }
@@ -38,11 +38,12 @@ struct DictationSessionTests {
         #expect(!events.contains { $0.typeName == "polished" })
     }
 
-    @Test func startsSpeculativePolishingBeforeTranscriptionFinalization() async throws {
+    @Test func shortStopUsesOneFinalCallWithoutExtraSpeculation() async throws {
         nonisolated(unsafe) var polishCalls = 0
         let events = try await runSession(
             config: .default,
             speculativeIntelligence: true,
+            customize: { $0.interimText = "Testing." },
             intelligence: ClosureIntelligence { transcript in
                 polishCalls += 1
                 #expect(transcript.lowercased().replacingOccurrences(of: ".", with: "") == "testing")
@@ -52,11 +53,32 @@ struct DictationSessionTests {
         )
         #expect(polishCalls == 1)
         #expect(events.contains { event in
-            if case .polished(_, _, _, let speculative) = event {
-                return speculative == true
+            if case .polished(_, _, _, let speculative, _) = event {
+                return speculative == nil
             }
             return false
         })
+    }
+
+    @Test func polishesInterimMidSpeechBeforeStop() async throws {
+        nonisolated(unsafe) var inputs: [String] = []
+        _ = try await runSession(
+            config: .default,
+            speculativeIntelligence: true,
+            customize: { fake in
+                fake.interimText = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron"
+            },
+            intelligence: ClosureIntelligence { transcript in
+                inputs.append(transcript)
+                try await Task.sleep(for: .milliseconds(20))
+                return IntelligenceResult(text: transcript, model: "test-flash-lite", latencyMs: 20)
+            }
+        )
+        // Interim (15 words) polishes during speech; the final still gets its
+        // own pass since it differs. No change when interim is tiny.
+        #expect(inputs.count == 2)
+        #expect(inputs[0].contains("alpha"))
+        #expect(inputs[1] == "Testing.")
     }
 
     @Test func abortsSpeculativePolishWhenTheFinalTranscriptIsIncompatible() async throws {
@@ -100,9 +122,10 @@ struct DictationSessionTests {
         #expect(events.last?.typeName == "complete")
     }
 
-    @Test func transcriptsCompatibleUsesWordOverlapAndLengthDelta() {
-        #expect(transcriptsCompatible("Testing.", "testing"))
-        #expect(transcriptsCompatible(
+    @Test func speculativeReuseRequiresExactSourceIncludingPunctuationAndCase() {
+        #expect(!transcriptsCompatible("Testing.", "testing"))
+        #expect(transcriptsCompatible("Testing.", "Testing."))
+        #expect(!transcriptsCompatible(
             "one two three four five six seven eight nine ten",
             "one two three four five six seven eight nine tens"
         ))
@@ -114,14 +137,66 @@ struct DictationSessionTests {
         #expect(!transcriptsCompatible("", "hello"))
     }
 
-    @Test func extractTrailingExtensionFindsAppendedWordsWhenPrefixMatches() {
-        let prefix = "I am using my own application to prompt this"
+    @Test func extractTrailingExtensionFindsAppendedWordsWhenPrefixMatches() {        let prefix = "I am using my own application to prompt this"
         let full = "I am using my own application to prompt this very prompt in you"
         let extensionWords = extractTrailingExtension(prefix: prefix, full: full)
         #expect(extensionWords == "very prompt in you")
 
         #expect(extractTrailingExtension(prefix: "completely different text", full: full) == nil)
         #expect(extractTrailingExtension(prefix: full, full: prefix) == nil)
+    }
+
+    @Test func cumulativeFinalReplacesAllCoveredSegments() {
+        let first = "First sentence was spoken earlier."
+        let second = "Then I added another sentence."
+        let cumulative = first + " " + second + " Here is the ending."
+        #expect(appendDedupedFinalSegment([first, second], cumulative) == [cumulative])
+        #expect(appendDedupedFinalSegment(["Keep this introduction.", first, second], cumulative)
+            == ["Keep this introduction.", cumulative])
+    }
+
+    @Test func interimPreviewDoesNotRepeatFinalizedWords() {
+        let first = "First sentence was spoken earlier."
+        let second = "Then I added another sentence."
+        #expect(transcriptDraft(finalSegments: [first], latestInterim: first) == first)
+        let cumulative = first + " " + second + " Here is the ending."
+        #expect(transcriptDraft(finalSegments: [first, second], latestInterim: cumulative) == cumulative)
+        #expect(transcriptDraft(finalSegments: [first], latestInterim: second) == first + "\n" + second)
+    }
+
+    @Test func newTurnAndSpokenRepetitionArePreserved() {
+        let repeated = "Please try again."
+        #expect(transcriptDraft(finalSegments: [repeated], latestInterim: repeated, startsNewTurn: true)
+            == repeated + "\n" + repeated)
+        #expect(transcriptDraft(finalSegments: [], latestInterim: "Very very useful. Please try again. Please try again.")
+            == "Very very useful. Please try again. Please try again.")
+    }
+
+    @Test func resendMatchingRequiresWholeWords() {
+        #expect(!normalizedTranscriptContains(haystack: "We discussed catering", needle: "cat"))
+        #expect(appendDedupedFinalSegment(["We discussed catering"], "cat") == ["We discussed catering", "cat"])
+    }
+
+    @Test func dedupedFinalSegmentsDropResendsAndMergeExtensions() {
+        #expect(appendDedupedFinalSegment(["hello world"], "hello world") == ["hello world"])
+        #expect(appendDedupedFinalSegment(["hello world"], "Hello, WORLD!") == ["hello world"])
+        #expect(appendDedupedFinalSegment(["hello"], "hello world") == ["hello world"])
+        #expect(appendDedupedFinalSegment(["one"], "two") == ["one", "two"])
+        #expect(appendDedupedFinalSegment(["one", "two three"], "two three four") == ["one", "two three four"])
+        #expect(appendDedupedFinalSegment(
+            ["here is the the maid speech i am speaking"],
+            "here is the speech i am speaking"
+        ) == ["here is the speech i am speaking"])
+        #expect(appendDedupedFinalSegment(
+            ["did you run some tests"],
+            "did you write some tests"
+        ) == ["did you write some tests"])
+        #expect(appendDedupedFinalSegment(["i like apples"], "i like oranges and bananas") == [
+            "i like apples", "i like oranges and bananas",
+        ])
+        #expect(appendDedupedFinalSegment([], "") == [])
+        #expect(normalizedTranscriptContains(haystack: "Please do not edit!", needle: "please do not edit"))
+        #expect(!normalizedTranscriptContains(haystack: "hello", needle: "hello world"))
     }
 
     @Test func ignoresMidSessionCompleteAndKeepsAcceptingAudioUntilStop() async throws {
@@ -247,6 +322,7 @@ private func runSession(
 
     try await session.start()
     try session.sendAudio(Data(count: 3200))
+    await Task.yield()
     try session.stop()
 
     try await withThrowingTaskGroup(of: Void.self) { group in

@@ -26,32 +26,34 @@ final class DictationController {
     let capture = MicrophoneCapture()
 
     private var isStreamingAudio = false
+    private var audioStream: PCMDeliveryStream?
+    private var preCapture = false
+    private var heldGestureActive = false
+    private var heldGestureStartedSession = false
     private var session: CoreDictationBox?
     private var targetApplication: String?
     private var cancelled = false
     private var didComplete = false
     private var finalSegments: [String] = []
+    private var startsNewTurn = false
     private var latestInterim: String = ""
     private var polishedText: String = ""
     private var polishedInput: String = ""
     private var completion: CheckedContinuation<Void, Error>?
     private var stopRequestedAt: UInt64 = 0
+    private var stopRequestedUptime: TimeInterval = 0
+    private var pipelineTiming: DictationTiming?
+    /// Key-down time of the tap that triggered this session (felt-latency anchor).
+    private var togglePressedAt: UInt64 = 0
     private var sessionGeneration = 0
+    /// Background polishes that completed while speaking (speculative receipts
+    /// this session). Logged on the Inserted line: spec>0 proves post work overlapped speech.
+    private var speculativeHits = 0
 
     init(settings: AppSettings, hud: FloatingHUDController, permissions: PermissionsMonitor) {
         self.settings = settings
         self.hud = hud
         self.permissions = permissions
-        capture.setPCMHandler { [weak self] data in
-            DispatchQueue.main.async {
-                guard let self, self.isStreamingAudio else { return }
-                do {
-                    try self.session?.sendAudio(data)
-                } catch {
-                    self.handleAudioSendFailure(AppLog.redact(error.localizedDescription))
-                }
-            }
-        }
     }
 
     var statusTitle: String {
@@ -73,21 +75,53 @@ final class DictationController {
     }
 
     func toggle() {
+        togglePressedAt = HotkeyMonitor.shared.lastTapDownTime
         switch phase {
         case .idle:
             startMicrophoneDictation()
         case .listening:
             beginStop()
         case .finalizing:
-            break
+            // Swallowed by design (stop already in flight), but say so: a
+            // silent keypress reads as a dead hotkey in the logs and the HUD.
+            AppLog.line("Toggle ignored; still finalizing.")
+            hud.nudge()
         }
     }
 
+    func beginHeldDictation() {
+        let wasIdle = phase == .idle
+        if wasIdle { startMicrophoneDictation() }
+        guard phase == .listening else { return }
+        heldGestureActive = true
+        heldGestureStartedSession = wasIdle
+    }
+
+    func finishHeldDictation() {
+        guard heldGestureActive else { return }
+        heldGestureActive = false
+        heldGestureStartedSession = false
+        togglePressedAt = HotkeyMonitor.shared.lastTapDownTime
+        if phase == .listening { beginStop() }
+    }
+
+    func cancelHeldDictation() {
+        let shouldCancel = heldGestureActive && heldGestureStartedSession
+        heldGestureActive = false
+        heldGestureStartedSession = false
+        if shouldCancel { cancel() }
+        else { discardHotkeyCapture() }
+    }
+
     func cancel() {
+        heldGestureActive = false
+        heldGestureStartedSession = false
+        discardHotkeyCapture()
         guard phase != .idle else { return }
         AppLog.line("Dictation cancelled (Escape).")
         cancelled = true
         isStreamingAudio = false
+        audioStream?.discard()
         sessionGeneration += 1
         finishWait(with: nil)
         capture.pause()
@@ -111,11 +145,37 @@ final class DictationController {
             )
             return
         }
+        discardHotkeyCapture()
         lastAudioCheck = await capture.audioCheck()
     }
 
+    /// Key-down captures locally; a tap or sustained hold commits buffered audio.
+    func prepareHotkeyCapture() {
+        guard phase == .idle, !preCapture else { return }
+        let stream = PCMDeliveryStream()
+        audioStream = stream
+        capture.setPCMHandler { stream.append($0) }
+        do {
+            capture.applyPreferredDevice(uniqueID: settings.audioDevice)
+            try capture.prepare()
+            try capture.start()
+            preCapture = true
+        } catch {
+            stream.discard()
+            audioStream = nil
+        }
+    }
+
+    func discardHotkeyCapture() {
+        guard preCapture, phase == .idle else { return }
+        capture.pause()
+        audioStream?.discard()
+        audioStream = nil
+        preCapture = false
+    }
+
     private func startMicrophoneDictation() {
-        guard let apiKey = requireAPIKey() else { return }
+        guard let apiKey = requireAPIKey() else { discardHotkeyCapture(); return }
         cancelled = false
         resetTranscriptState()
         targetApplication = PasteController.frontmostApplication()
@@ -127,16 +187,24 @@ final class DictationController {
         lastError = ""
         AppLog.line("Option: starting dictation.")
 
-        do {
-            capture.applyPreferredDevice(uniqueID: settings.audioDevice)
-            try capture.prepare()
-            try capture.start()
-        } catch {
-            failStart(error.localizedDescription)
-            return
+        if !preCapture {
+            let stream = PCMDeliveryStream()
+            audioStream = stream
+            capture.setPCMHandler { stream.append($0) }
+            do {
+                capture.applyPreferredDevice(uniqueID: settings.audioDevice)
+                try capture.prepare()
+                try capture.start()
+            } catch { failStart(error.localizedDescription); return }
         }
-
+        preCapture = false
         startSession(apiKey: apiKey)
+        let generation = sessionGeneration
+        audioStream?.commit { [weak self] block in
+            guard let self, self.sessionGeneration == generation, !self.cancelled else { return }
+            do { try self.session?.sendAudio(block.pcm) }
+            catch { self.handleAudioSendFailure(AppLog.redact(error.localizedDescription)) }
+        }
     }
 
     private func startSession(apiKey: String) {
@@ -147,9 +215,10 @@ final class DictationController {
             let box = CoreDictationBox(
                 apiKey: apiKey,
                 config: config,
-                intelligenceModel: settings.environment.intelligenceModel
+                intelligenceModel: settings.environment.intelligenceModel,
+                patchEditing: settings.environment.patchEditing
             ) { [weak self] event in
-                Task { @MainActor in
+                DispatchQueue.main.async {
                     self?.handle(event, generation: generation)
                 }
             }
@@ -172,9 +241,11 @@ final class DictationController {
         guard phase == .listening else { return }
         phase = .finalizing
         stopRequestedAt = mach_absolute_time()
+        stopRequestedUptime = ProcessInfo.processInfo.systemUptime
         hud.setState("polishing")
         SoundPlayer.play(.pop)
         AppLog.line("Option: stopping and polishing dictation.")
+        session?.prepareToStop(at: stopRequestedUptime)
         let tailNs = UInt64(max(0, settings.stopTailMs)) * 1_000_000
         let generation = sessionGeneration
         Task {
@@ -182,11 +253,15 @@ final class DictationController {
                 try? await Task.sleep(nanoseconds: tailNs)
             }
             guard self.sessionGeneration == generation, !self.cancelled else { return }
-            self.isStreamingAudio = false
             self.capture.pause()
+            let boundary = await self.audioStream?.drain() ?? 0
+            guard self.sessionGeneration == generation, !self.cancelled else { return }
+            self.isStreamingAudio = false
+            AppLog.line("Audio drained through sample \(boundary), \(Int(timeIntervalSinceAbsoluteTime(self.stopRequestedAt) * 1000)) ms after stop.")
             do {
                 try self.session?.flush()
                 try self.session?.stop()
+                self.hud.updateStatus("Waiting for transcript…")
             } catch {
                 AppLog.line("Stop failed: \(error.localizedDescription)")
                 if !self.draftText().isEmpty {
@@ -199,6 +274,7 @@ final class DictationController {
             do {
                 try await self.waitForCompletion()
                 guard !self.cancelled else { return }
+                self.hud.updateStatus("Pasting…")
                 await self.insertResult()
             } catch {
                 guard !self.cancelled else { return }
@@ -221,27 +297,36 @@ final class DictationController {
                 hud.updateText(draftText())
                 interimPreview = draftText()
             }
+        case .turnBoundary:
+            startsNewTurn = true
         case .final:
-            if !event.text.isEmpty {
-                finalSegments.append(event.text)
-            }
+            let merged = startsNewTurn ? finalSegments + [event.text] : appendDedupedFinalSegment(finalSegments, event.text)
+            startsNewTurn = false
+            finalSegments = merged
             latestInterim = ""
             hud.updateText(draftText())
             interimPreview = draftText()
         case .polished:
             polishedText = event.text
-            let rawDraft = (finalSegments + [latestInterim])
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !rawDraft.isEmpty {
-                polishedInput = rawDraft
-            }
+            polishedInput = event.source
             lastPolishLatencyMs = event.latencyMs
             lastSpeculative = event.speculative
+            // Only while listening: the final reuse emit after stop is also
+            // speculative-flagged but proves nothing about speak-time overlap.
+            if event.speculative, phase == .listening {
+                speculativeHits += 1
+            }
             if phase == .listening {
                 hud.updateText(draftText())
                 interimPreview = draftText()
+            }
+        case .timing:
+            pipelineTiming = event.timing
+            if event.timing?.outcome.hasPrefix("raw_") == true {
+                polishedText = ""
+                polishedInput = ""
+                lastPolishLatencyMs = 0
+                lastSpeculative = false
             }
         case .complete:
             didComplete = true
@@ -273,22 +358,21 @@ final class DictationController {
         guard phase == .listening else { return }
         isStreamingAudio = false
         AppLog.line("Microphone stream failed: \(detail)")
-        let buffered = draftText()
-        if !buffered.isEmpty {
-            AppLog.line("Microphone stream failed with buffered text present; inserting transcript.")
-            Task {
-                await self.insertResult()
-            }
-            return
-        }
-        interimPreview = ""
+        interimPreview = draftText()
         handleFailure("\(detail) No text was inserted; start dictation again.", code: code)
     }
 
     private func insertResult() async {
         isStreamingAudio = false
         hud.hide()
-        let text = polishedText.isEmpty ? draftText() : polishedText
+        let text = draftText()
+        let timing = pipelineTiming
+        let stopTime = stopRequestedUptime
+        let stopMachTime = stopRequestedAt
+        let pressTime = togglePressedAt
+        let usedPolish = !polishedText.isEmpty && transcriptsCompatible(polishedInput, transcriptDraft(finalSegments: finalSegments, latestInterim: latestInterim, startsNewTurn: startsNewTurn))
+        capture.pause()
+        audioStream?.discard()
         session?.close()
         session = nil
         phase = .idle
@@ -305,15 +389,19 @@ final class DictationController {
         }
         do {
             let pasted = try await PasteController.pasteIntoFocusedApplication(text, expectedApplication: expected)
+            let postedAt = ProcessInfo.processInfo.systemUptime
+            let stopToPasteMs = stopTime > 0 ? Int(((postedAt - stopTime) * 1000).rounded()) : 0
+            let pressToPaste = pressTime > 0
+                ? " (\(Int((timeIntervalSinceAbsoluteTime(pressTime) * 1_000).rounded())) ms after press)" : ""
+            let outcome = usedPolish ? (timing?.outcome ?? "polished_unverified") : (timing?.outcome.hasPrefix("raw_") == true ? timing!.outcome : "raw_fallback")
+            AppLog.line("\(pasted ? "Inserted" : "Copied") \(text.count) characters in \(stopToPasteMs) ms after stop\(pressToPaste) outcome=\(outcome).")
+            if let timing {
+                let deliveryMs = Int((max(0, postedAt - timing.readyAt) * 1000).rounded())
+                AppLog.line("latency session=\(timing.sessionID) capture_ms=\(timing.captureMs) live_ms=\(timing.liveMs) polish_wait_ms=\(timing.polishWaitMs) delivery_ms=\(deliveryMs) total_ms=\(stopToPasteMs) outcome=\(outcome) background_jobs=\(timing.backgroundJobs) final_jobs=\(timing.finalJobs) live_fallback=\(timing.liveFallback) pasted=\(pasted)")
+            }
+            if stopRequestedAt == stopMachTime { stopRequestedAt = 0 }
             SoundPlayer.play(pasted ? .glass : .pop)
-            let stopToPasteMs = stopRequestedAt > 0
-                ? Int((timeIntervalSinceAbsoluteTime(stopRequestedAt) * 1_000).rounded())
-                : 0
-            AppLog.line(
-                "\(pasted ? "Inserted" : "Copied") \(text.count) characters in \(stopToPasteMs) ms after stop " +
-                    "(Flash-Lite \(lastPolishLatencyMs) ms, \(lastSpeculative ? "overlapped" : "after final"))."
-            )
-            stopRequestedAt = 0
+
         } catch {
             SoundPlayer.play(.basso)
             do {
@@ -338,6 +426,7 @@ final class DictationController {
         hud.setState("error")
         hud.hide()
         capture.pause()
+        audioStream?.discard()
         session?.close()
         session = nil
         phase = .idle
@@ -351,6 +440,7 @@ final class DictationController {
     private func failStart(_ message: String, code: String = "") {
         isStreamingAudio = false
         capture.pause()
+        audioStream?.discard()
         session?.close()
         session = nil
         phase = .idle
@@ -375,12 +465,16 @@ final class DictationController {
     }
 
     private func resetTranscriptState() {
+        pipelineTiming = nil
         finalSegments = []
+        startsNewTurn = false
         latestInterim = ""
         polishedText = ""
         polishedInput = ""
         lastPolishLatencyMs = 0
         lastSpeculative = false
+        speculativeHits = 0
+        togglePressedAt = 0
         interimPreview = ""
         lastError = ""
         didComplete = false
@@ -411,37 +505,13 @@ final class DictationController {
     }
 
     private func draftText() -> String {
-        let rawDraft = (finalSegments + [latestInterim])
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawDraft = transcriptDraft(finalSegments: finalSegments, latestInterim: latestInterim, startsNewTurn: startsNewTurn)
 
         guard !polishedText.isEmpty else {
             return rawDraft
         }
 
-        // Gapless Compositor:
-        // 1. If rawDraft matches polishedInput, show polishedText directly.
-        if transcriptsCompatible(polishedInput, rawDraft) {
-            return polishedText
-        }
-
-        // 2. If rawDraft has newly arrived text (unpolished final segments or active interim),
-        // extract whatever trailing extension was NOT yet polished and append it seamlessly.
-        // Completed words NEVER vanish or flicker!
-        if !polishedInput.isEmpty,
-           let trailing = extractTrailingExtension(prefix: polishedInput, full: rawDraft),
-           !trailing.isEmpty
-        {
-            return joinUniqueTranscript(polishedText, trailing)
-        }
-
-        // 3. If there is an active interim stream not yet part of the polished text, append it.
-        if !latestInterim.isEmpty && !polishedText.contains(latestInterim) {
-            return (polishedText + "\n" + latestInterim).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        return polishedText
+        return transcriptsCompatible(polishedInput, rawDraft) ? polishedText : rawDraft
     }
 
     private func finishWait(with error: Error?) {

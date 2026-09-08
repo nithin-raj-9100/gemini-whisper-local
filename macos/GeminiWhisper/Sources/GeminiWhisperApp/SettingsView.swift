@@ -27,7 +27,7 @@ struct SettingsView: View {
                         Text(mode.title).tag(mode)
                     }
                 }
-                Text("Manual keeps pauses in one dictation (recommended for Right Option). Automatic and hybrid end a turn after the silence duration.")
+                Text("Manual keeps pauses in one dictation. Automatic uses the server silence duration. Hybrid also finalizes during locally detected pauses; dictation continues until you press Stop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 TextField("VAD prefix padding (ms)", value: Bindable(settings).vadPrefixPaddingMs, format: .number)

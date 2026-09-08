@@ -26,6 +26,11 @@ mkdir -p "$APP_OUT/Contents/MacOS"
 mkdir -p "$APP_OUT/Contents/Resources"
 
 cp "$PACKAGE_DIR/Resources/Info.plist" "$APP_OUT/Contents/Info.plist"
+cp "$PACKAGE_DIR/Resources/AppIcon.icns" "$APP_OUT/Contents/Resources/AppIcon.icns"
+if [[ -f "$REPO_DIR/.env" ]]; then
+  cp "$REPO_DIR/.env" "$APP_OUT/Contents/Resources/.env"
+  chmod 0600 "$APP_OUT/Contents/Resources/.env"
+fi
 cp "$BIN" "$APP_OUT/Contents/MacOS/GeminiWhisper"
 chmod +x "$APP_OUT/Contents/MacOS/GeminiWhisper"
 echo -n "APPL????" > "$APP_OUT/Contents/PkgInfo"
@@ -39,6 +44,23 @@ codesign --force --sign - \
   --requirements '=designated => identifier "com.nithin.gemini-whisper"' \
   --timestamp=none \
   "$APP_OUT"
+
+touch "$APP_OUT"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -R "$APP_OUT" 2>/dev/null || true
+
+INSTALLED_APP="/Applications/Gemini Whisper.app"
+if [[ -d "$INSTALLED_APP" ]]; then
+  echo "Syncing build to $INSTALLED_APP"
+  rm -rf "$INSTALLED_APP"
+  cp -R "$APP_OUT" "$INSTALLED_APP"
+  codesign --force --sign - \
+    --identifier com.nithin.gemini-whisper \
+    --requirements '=designated => identifier "com.nithin.gemini-whisper"' \
+    --timestamp=none \
+    "$INSTALLED_APP"
+  touch "$INSTALLED_APP"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -R "$INSTALLED_APP" 2>/dev/null || true
+fi
 
 echo "Signed $APP_OUT"
 echo "Run with: open -g $APP_OUT"

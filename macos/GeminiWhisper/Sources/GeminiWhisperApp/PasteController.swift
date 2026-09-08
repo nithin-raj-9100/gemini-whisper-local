@@ -12,7 +12,7 @@ enum PasteController {
     /// kVK_Command
     private static let keyCodeCommand: CGKeyCode = 0x37
     private static let pasteboardSettleNanoseconds: UInt64 = 50_000_000
-    private static let pasteConsumeNanoseconds: UInt64 = 800_000_000
+    private static let pasteConsumeNanoseconds: UInt64 = 400_000_000
 
     static var executableURL: URL {
         Bundle.main.executableURL ?? Bundle.main.bundleURL
@@ -92,20 +92,25 @@ enum PasteController {
         do {
             try await Task.sleep(nanoseconds: pasteboardSettleNanoseconds)
             try postCommandV()
-            AppLog.line("Paste Cmd+V posted to cghidEventTap; waiting 400ms before clipboard restore")
-            try await Task.sleep(nanoseconds: pasteConsumeNanoseconds)
-
-            // If Accessibility is still false, keep the transcript on the clipboard so Cmd+V works
-            // even when HID events were dropped. AXIsProcessTrusted() can also stay false after a
-            // rebuild while Settings still shows ON (stale TCC CDHash).
+            // If Accessibility is still false the HID events were likely
+            // dropped: keep the transcript on the clipboard so Cmd+V works
+            // even when posted events vanish. AXIsProcessTrusted() can also
+            // stay false after a rebuild while Settings still shows ON
+            // (stale TCC CDHash).
             let trustedAfterPost = AXIsProcessTrusted()
             if !trustedAfterPost {
                 AppLog.line("Paste events posted but trusted=false; leaving transcript on clipboard")
                 throw PasteError.needsAccessibility(pastePermissionMessage())
             }
 
-            snapshot.restore(to: pasteboard)
-            AppLog.line("Paste clipboard restored after 400ms trusted=true")
+            // Keystrokes are posted: return now so stop-to-paste isn't gated
+            // on the consume window. The user's clipboard is restored in the
+            // background once the target has consumed the paste.
+            AppLog.line("Paste Cmd+V posted to cghidEventTap; clipboard restore scheduled")
+            Task {
+                try? await Task.sleep(nanoseconds: pasteConsumeNanoseconds)
+                snapshot.restore(to: pasteboard)
+            }
             return true
         } catch let error as PasteError {
             if case .needsAccessibility(_) = error {

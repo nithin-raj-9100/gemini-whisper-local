@@ -230,4 +230,28 @@ final class FloatingHUDController: NSObject {
         statusDot?.layer?.removeAnimation(forKey: "pulse")
         statusDot?.layer?.opacity = 1.0
     }
+
+    /// Status-line-only update: never touches state, dot, or transcript text.
+    /// Used for progress feedback while finalizing.
+    func updateStatus(_ text: String) {
+        guard isCurrentlyActive else { return }
+        statusLabel?.stringValue = text
+    }
+
+    /// One-shot acknowledgement blip that never changes state or text.
+    /// Used when a toggle arrives while finalizing so the keypress feels
+    /// received instead of dead.
+    func nudge() {
+        guard isCurrentlyActive, let layer = statusDot?.layer else { return }
+        layer.removeAnimation(forKey: "nudge")
+        let pop = CABasicAnimation(keyPath: "transform.scale")
+        pop.duration = 0.12
+        pop.fromValue = 1.0
+        pop.toValue = 1.7
+        pop.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        pop.autoreverses = true
+        pop.repeatCount = 1
+        pop.isRemovedOnCompletion = true
+        layer.add(pop, forKey: "nudge")
+    }
 }

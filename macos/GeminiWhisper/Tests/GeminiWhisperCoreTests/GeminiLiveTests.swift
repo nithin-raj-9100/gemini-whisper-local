@@ -225,7 +225,7 @@ struct GeminiLiveTests {
         try transcriber.finish()
 
         #expect(socket.sent.count == sentBeforeFinish)
-        #expect(eventTypes == ["ready", "speech-start", "final", "speech-end", "complete"])
+        #expect(eventTypes == ["ready", "speech-start", "final", "turn-boundary", "speech-end", "complete"])
     }
 
     @Test func promotesAnInterimHypothesisWhenTurnCompletionOmitsAFinalTranscript() async throws {
@@ -414,7 +414,7 @@ struct GeminiLiveTests {
         }
     }
 
-    @Test func finishTimeoutPromotesLatestInterimToComplete() async throws {
+    @Test func waitsBeyondFastGraceForFinalWords() async throws {
         let socket = FakeWebSocket()
         var events: [ServerEvent] = []
         let transcriber = GeminiLiveTranscriber(
@@ -438,13 +438,12 @@ struct GeminiLiveTests {
         try transcriber.finish()
 
         try await Task.sleep(for: .milliseconds(1_500))
-        #expect(events.contains(.final(text: "Words from the HUD")))
-        #expect(events.contains { event in
-            if case .warning(let code, _) = event { return code == "finalization_ack_timeout" }
-            return false
-        })
+        #expect(!events.contains { $0.typeName == "complete" })
+        socket.simulateJSON([
+            "serverContent": ["inputTranscription": ["text": "Words from the HUD including the last words"]],
+        ])
+        #expect(events.contains(.final(text: "Words from the HUD including the last words")))
         #expect(events.last?.typeName == "complete")
-        #expect(!events.contains { $0.typeName == "error" })
     }
 
     @Test func unexpectedCloseWhileListeningDoesNotCompleteUntilFinish() async throws {
