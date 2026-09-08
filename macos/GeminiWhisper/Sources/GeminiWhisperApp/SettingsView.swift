@@ -22,6 +22,11 @@ struct SettingsView: View {
                 }
                 Toggle("Polish with Flash-Lite", isOn: Bindable(settings).polish)
                     .disabled(settings.mode == .verbatim)
+                Toggle("Insert immediately, polish in place", isOn: Bindable(settings).optimisticPaste)
+                    .disabled(settings.mode == .verbatim || !settings.polish)
+                Text("Pastes the raw transcript the moment it settles, then reselects and replaces it once polish lands, so text appears at verbatim speed with polished output. The replacement is skipped if you type or click first, leaving the raw text. Turn off if you dictate into editors that auto-indent or auto-complete while you wait.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Picker("VAD", selection: Bindable(settings).vad) {
                     ForEach(AppVadMode.allCases) { mode in
                         Text(mode.title).tag(mode)

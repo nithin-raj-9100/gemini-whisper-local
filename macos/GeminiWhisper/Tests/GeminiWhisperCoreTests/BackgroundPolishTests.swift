@@ -84,6 +84,100 @@ struct BackgroundPolishTests {
         session.close()
     }
 
+    @Test func stopEdgeSpeculationIsReusedInsteadOfAFreshFinalCall() async throws {
+        let log = EventLog()
+        let counter = CallCounter()
+        let started = Signal()
+        let session = DictationSession(apiKey: "test-only", emit: { log.append($0) },
+            transcriberFactory: { _, emit in
+                let fake = FakeTranscriber(emit: emit)
+                // Final text matches the interim, so the stop-edge draft is still
+                // the final input and the speculation stays eligible for reuse.
+                fake.finalText = "testing"
+                return fake
+            },
+            intelligence: ClosureIntelligence { input in
+                counter.increment()
+                started.signal()
+                try? await Task.sleep(for: .milliseconds(30))
+                return IntelligenceResult(text: input + "!", model: "test", latencyMs: 1)
+            })
+        try await session.start()
+        try session.sendAudio(Data(count: 3200))
+
+        // The stop gesture alone must start polishing, before stop() is called.
+        session.prepareToStop()
+        await started.wait()
+        #expect(counter.value == 1)
+
+        try session.stop()
+        for _ in 0..<1000 {
+            if log.snapshot().last?.typeName == "complete" { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let timing = log.snapshot().compactMap { event -> DictationTiming? in
+            if case .timing(let value) = event { return value }; return nil
+        }.last
+        #expect(timing?.outcome.hasPrefix("reused") == true)
+        #expect(timing?.finalJobs == 0)
+        #expect(counter.value == 1)
+        #expect(log.snapshot().contains { if case .polished(let text, _, _, _, _) = $0 { return text == "testing!" }; return false })
+        session.close()
+    }
+
+    @Test func provisionalRawTranscriptIsAnnouncedBeforePolishCompletes() async throws {
+        let log = EventLog()
+        let session = DictationSession(apiKey: "test-only", emit: { log.append($0) },
+            transcriberFactory: { _, emit in FakeTranscriber(emit: emit) },
+            intelligence: ClosureIntelligence { input in
+                try? await Task.sleep(for: .milliseconds(40))
+                return IntelligenceResult(text: input + " polished", model: "test", latencyMs: 1)
+            }, backgroundPolicy: .init(maximumJobs: 0))
+        try await session.start()
+        try session.sendAudio(Data(count: 3200))
+        try session.stop()
+        for _ in 0..<1000 {
+            if log.snapshot().last?.typeName == "complete" { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let names = log.snapshot().map(\.typeName)
+        let provisional = names.firstIndex(of: "provisional")
+        let polished = names.firstIndex(of: "polished")
+        #expect(provisional != nil)
+        // The raw text must be offered strictly before the polished replacement.
+        #expect(provisional! < polished!)
+        #expect(log.snapshot().contains { if case .provisional(let text) = $0 { return text == "Testing." }; return false })
+        session.close()
+    }
+
+    @Test func readySpeculationSkipsProvisionalBecauseNothingWouldBeRepaired() async throws {
+        let log = EventLog()
+        let session = DictationSession(apiKey: "test-only", emit: { log.append($0) },
+            transcriberFactory: { _, emit in
+                let fake = FakeTranscriber(emit: emit)
+                fake.finalText = "testing"
+                return fake
+            },
+            intelligence: ClosureIntelligence { input in
+                IntelligenceResult(text: input + "!", model: "test", latencyMs: 1)
+            })
+        try await session.start()
+        try session.sendAudio(Data(count: 3200))
+        session.prepareToStop()
+        // Let the stop-edge speculation finish so a candidate is already banked.
+        for _ in 0..<1000 {
+            if log.snapshot().contains(where: { $0.typeName == "polished" }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        try session.stop()
+        for _ in 0..<1000 {
+            if log.snapshot().last?.typeName == "complete" { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(!log.snapshot().contains { $0.typeName == "provisional" })
+        session.close()
+    }
+
     @Test func failedFinalReportsRawInsteadOfOldPolishTiming() async throws {
         let log = EventLog()
         let session = DictationSession(apiKey: "test-only", emit: { log.append($0) },
@@ -100,6 +194,22 @@ struct BackgroundPolishTests {
         #expect(log.snapshot().contains { if case .timing(let value) = $0 { return value.outcome == "raw_failure" }; return false })
         #expect(!log.snapshot().contains { $0.typeName == "polished" })
         session.close()
+    }
+}
+
+/// One-shot latch so a test can wait for work to begin without polling a sleep.
+private final class Signal: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let once = NSLock()
+    private var fired = false
+    func signal() { once.withLock { if !fired { fired = true; semaphore.signal() } } }
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                _ = self.semaphore.wait(timeout: .now() + 2)
+                continuation.resume()
+            }
+        }
     }
 }
 

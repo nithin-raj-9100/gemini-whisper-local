@@ -9,6 +9,8 @@ struct AppEnvironment: Sendable {
     var stopTailMs: Int
     var intelligenceModel: String?
     var patchEditing: Bool
+    /// nil when unset: the Settings toggle owns this unless .env forces a value.
+    var optimisticPasteOverride: Bool?
     var envFileURL: URL?
 
     static let defaultLanguage = "en-IN"
@@ -38,6 +40,10 @@ struct AppEnvironment: Sendable {
             stopTailMs: max(0, stopTail),
             intelligenceModel: model.isEmpty ? nil : model,
             patchEditing: value("GEMINI_WHISPER_PATCH_EDITING") == "1",
+            optimisticPasteOverride: {
+                let raw = value("GEMINI_WHISPER_OPTIMISTIC_PASTE")
+                return raw.isEmpty ? nil : raw == "1"
+            }(),
             envFileURL: fileURL
         )
     }

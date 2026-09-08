@@ -73,6 +73,7 @@ struct AppTranscriptEvent: Sendable {
         case interim
         case final
         case polished
+        case provisional
         case warning
         case timing
         case complete
@@ -118,6 +119,8 @@ func adaptServerEvent(_ event: ServerEvent) -> AppTranscriptEvent {
             latencyMs: latencyMs,
             speculative: speculative ?? false
         )
+    case .provisional(let text):
+        return makeEvent(kind: .provisional, text: text)
     case .warning(let code, let message):
         return makeEvent(kind: .warning, code: code, message: AppLog.redact(message))
     case .timing(let timing):

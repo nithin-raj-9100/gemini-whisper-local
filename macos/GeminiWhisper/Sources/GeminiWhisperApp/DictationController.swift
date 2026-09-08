@@ -50,6 +50,12 @@ final class DictationController {
     /// Background polishes that completed while speaking (speculative receipts
     /// this session). Logged on the Inserted line: spec>0 proves post work overlapped speech.
     private var speculativeHits = 0
+    /// Text already inserted optimistically while polish was still running,
+    /// plus the app it went into. Non-nil means insertResult must repair
+    /// in place rather than paste again.
+    private var optimisticInsert: (text: String, application: String?)?
+    private var repairAborted = false
+    private var userInputMonitor: Any?
 
     init(settings: AppSettings, hud: FloatingHUDController, permissions: PermissionsMonitor) {
         self.settings = settings
@@ -122,6 +128,10 @@ final class DictationController {
         AppLog.line("Dictation cancelled (Escape).")
         cancelled = true
         isStreamingAudio = false
+        // Escape after an optimistic insert leaves that text in place: it was
+        // really typed into the target and is not ours to retract.
+        optimisticInsert = nil
+        endRepairWatch()
         audioStream?.discard()
         sessionGeneration += 1
         finishWait(with: nil)
@@ -330,6 +340,8 @@ final class DictationController {
                 hud.updateText(draftText())
                 interimPreview = draftText()
             }
+        case .provisional:
+            handleProvisional(event.text, generation: generation)
         case .timing:
             pipelineTiming = event.timing
             if event.timing?.outcome.hasPrefix("raw_") == true {
@@ -372,6 +384,94 @@ final class DictationController {
         handleFailure("\(detail) No text was inserted; start dictation again.", code: code)
     }
 
+    /// Final delivery. When text was already inserted optimistically, replace just
+    /// that text in place instead of pasting a second copy; when polish did not
+    /// change it, nothing needs to happen at all.
+    private func deliver(_ text: String, expectedApplication: String?) async throws -> Bool {
+        guard let pending = optimisticInsert else {
+            return try await PasteController.pasteIntoFocusedApplication(text, expectedApplication: expectedApplication)
+        }
+        optimisticInsert = nil
+        endRepairWatch()
+        if pending.text == text {
+            AppLog.line("Repair unnecessary; polish matched the optimistic insert.")
+            return true
+        }
+        if repairAborted {
+            AppLog.line("Repair skipped; optimistic text left in place to avoid corrupting user edits.")
+            return true
+        }
+        do {
+            let repaired = try await PasteController.replaceLastCharacters(
+                count: pending.text.count, with: text, expectedApplication: pending.application
+            )
+            if repaired { return true }
+            AppLog.line("Repair declined; optimistic text left in place.")
+            return true
+        } catch {
+            // The optimistic text is already correct-enough raw output. Never
+            // paste a second copy on top of it just because the repair failed.
+            AppLog.line("Repair failed: \(AppLog.redact(error.localizedDescription)); optimistic text left in place.")
+            return true
+        }
+    }
+
+    /// Raw transcript settled while polish is still running. Insert it now so the
+    /// user sees text at raw-mode latency; insertResult() repairs it in place when
+    /// the polished version lands. Opt-in: reselecting text is only safe while the
+    /// user has not touched the target, so this is off unless explicitly enabled.
+    private func handleProvisional(_ text: String, generation: Int) {
+        guard settings.optimisticPaste, phase == .finalizing,
+              optimisticInsert == nil, !cancelled, !text.isEmpty else { return }
+        let expected = targetApplication
+        optimisticInsert = (text, expected)
+        repairAborted = false
+        Task { @MainActor in
+            guard self.sessionGeneration == generation, !self.cancelled else { return }
+            do {
+                let pasted = try await PasteController.pasteIntoFocusedApplication(text, expectedApplication: expected)
+                guard pasted else {
+                    // Copied rather than pasted: there is nothing in the target to repair.
+                    self.optimisticInsert = nil
+                    return
+                }
+                let stopToPasteMs = self.stopRequestedUptime > 0
+                    ? Int(((ProcessInfo.processInfo.systemUptime - self.stopRequestedUptime) * 1000).rounded()) : 0
+                AppLog.line("Optimistic insert of \(text.count) characters in \(stopToPasteMs) ms after stop; awaiting polish.")
+                self.hud.updateStatus("Polishing inserted text…")
+                self.beginRepairWatch()
+            } catch {
+                self.optimisticInsert = nil
+                AppLog.line("Optimistic insert failed: \(AppLog.redact(error.localizedDescription)); falling back to a single paste.")
+            }
+        }
+    }
+
+    /// Any real keystroke or click after the optimistic insert invalidates the
+    /// character count the repair selection depends on. Start watching only after
+    /// our own synthetic Cmd+V has flushed, so it does not abort on itself.
+    private func beginRepairWatch() {
+        endRepairWatch()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard self.optimisticInsert != nil, !self.repairAborted else { return }
+            self.userInputMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.keyDown, .leftMouseDown, .rightMouseDown]
+            ) { [weak self] _ in
+                guard let self, !self.repairAborted else { return }
+                self.repairAborted = true
+                AppLog.line("Repair aborted; the user typed or clicked after the optimistic insert.")
+            }
+        }
+    }
+
+    private func endRepairWatch() {
+        if let userInputMonitor {
+            NSEvent.removeMonitor(userInputMonitor)
+        }
+        userInputMonitor = nil
+    }
+
     private func insertResult() async {
         isStreamingAudio = false
         hud.hide()
@@ -398,7 +498,7 @@ final class DictationController {
             return
         }
         do {
-            let pasted = try await PasteController.pasteIntoFocusedApplication(text, expectedApplication: expected)
+            let pasted = try await deliver(text, expectedApplication: expected)
             let postedAt = ProcessInfo.processInfo.systemUptime
             let stopToPasteMs = stopTime > 0 ? Int(((postedAt - stopTime) * 1000).rounded()) : 0
             let pressToPaste = pressTime > 0
@@ -433,6 +533,8 @@ final class DictationController {
 
     private func handleFailure(_ detail: String, code: String = "") {
         isStreamingAudio = false
+        optimisticInsert = nil
+        endRepairWatch()
         hud.setState("error")
         hud.hide()
         capture.pause()

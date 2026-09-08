@@ -26,7 +26,8 @@ CI (`.github/workflows/ci.yml`) runs those Swift build/test commands on macos-la
 
 Environment: `GEMINI_API_KEY` (app process only), `GEMINI_WHISPER_LANGUAGE`,
 `GEMINI_WHISPER_AUDIO_DEVICE` (`:0` or empty = system default input uniqueID, not ffmpeg `:N`),
-`GEMINI_WHISPER_STOP_TAIL_MS`, `GEMINI_WHISPER_INTELLIGENCE_MODEL`. See `.env.example`.
+`GEMINI_WHISPER_STOP_TAIL_MS`, `GEMINI_WHISPER_INTELLIGENCE_MODEL`,
+`GEMINI_WHISPER_OPTIMISTIC_PASTE` (forces the paste-then-repair Settings toggle). See `.env.example`.
 Never print, transmit, or commit the API key or `.env`.
 
 ## Architecture

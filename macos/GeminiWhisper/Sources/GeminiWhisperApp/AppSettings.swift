@@ -36,6 +36,7 @@ final class AppSettings {
         static let vadPrefixPaddingMs = "vadPrefixPaddingMs"
         static let vadSilenceDurationMs = "vadSilenceDurationMs"
         static let openAtLogin = "openAtLogin"
+        static let optimisticPaste = "optimisticPaste"
     }
 
     /// Empty string means the system default input (not an ffmpeg `:N` index).
@@ -50,6 +51,7 @@ final class AppSettings {
     var vadPrefixPaddingMs: Int
     var vadSilenceDurationMs: Int
     var openAtLogin: Bool
+    var optimisticPaste: Bool
     var stopTailMs: Int
     let environment: AppEnvironment
 
@@ -95,6 +97,13 @@ final class AppSettings {
         self.openAtLogin = defaults.object(forKey: Keys.openAtLogin) != nil
             ? defaults.bool(forKey: Keys.openAtLogin)
             : false
+        // On by default: every failure path leaves the raw text in place, so the
+        // worst case is verbatim output at verbatim latency. The env var only
+        // seeds the first launch; the Settings toggle owns it afterwards.
+        self.optimisticPaste = environment.optimisticPasteOverride
+            ?? (defaults.object(forKey: Keys.optimisticPaste) != nil
+                ? defaults.bool(forKey: Keys.optimisticPaste)
+                : true)
     }
 
     func persist(defaults: UserDefaults = .standard) {
@@ -109,5 +118,6 @@ final class AppSettings {
         defaults.set(vadPrefixPaddingMs, forKey: Keys.vadPrefixPaddingMs)
         defaults.set(vadSilenceDurationMs, forKey: Keys.vadSilenceDurationMs)
         defaults.set(openAtLogin, forKey: Keys.openAtLogin)
+        defaults.set(optimisticPaste, forKey: Keys.optimisticPaste)
     }
 }

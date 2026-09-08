@@ -11,6 +11,8 @@ enum PasteController {
     private static let keyCodeV: CGKeyCode = 0x09
     /// kVK_Command
     private static let keyCodeCommand: CGKeyCode = 0x37
+    /// kVK_LeftArrow
+    private static let keyCodeLeftArrow: CGKeyCode = 0x7B
     private static let pasteboardSettleNanoseconds: UInt64 = 50_000_000
     private static let pasteConsumeNanoseconds: UInt64 = 400_000_000
 
@@ -123,6 +125,66 @@ enum PasteController {
             snapshot.restore(to: pasteboard)
             AppLog.line("Paste failed: \(error.localizedDescription)")
             throw error
+        }
+    }
+
+    /// Reselect the last `count` characters this app inserted and paste `text`
+    /// over them. Arrow keys move by grapheme cluster, which is exactly what
+    /// String.count measures, so the selection matches what was inserted.
+    /// Returns false when the target refused the selection keystrokes.
+    @discardableResult
+    static func replaceLastCharacters(count: Int, with text: String, expectedApplication: String?) async throws -> Bool {
+        guard count > 0 else { return false }
+        guard AXIsProcessTrusted() else {
+            throw PasteError.needsAccessibility(pastePermissionMessage())
+        }
+        let currentApplication = frontmostApplication()
+        if let expectedApplication, currentApplication != expectedApplication {
+            AppLog.line("Repair skipped; focus moved \(expectedApplication) -> \(currentApplication ?? "nil")")
+            return false
+        }
+
+        let pasteboard = NSPasteboard.general
+        let snapshot = ClipboardSnapshot.replaceString(text, on: pasteboard)
+        guard pasteboard.string(forType: .string) == text else {
+            snapshot.restore(to: pasteboard)
+            throw PasteError.failed("Could not write the polished transcript to the clipboard.")
+        }
+        do {
+            try await Task.sleep(nanoseconds: pasteboardSettleNanoseconds)
+            try postShiftLeftArrow(times: count)
+            try postCommandV()
+            AppLog.line("Repair replaced \(count) characters with \(text.count); clipboard restore scheduled")
+            Task {
+                try? await Task.sleep(nanoseconds: pasteConsumeNanoseconds)
+                snapshot.restore(to: pasteboard)
+            }
+            return true
+        } catch {
+            snapshot.restore(to: pasteboard)
+            AppLog.line("Repair failed: \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    private static func postShiftLeftArrow(times: Int) throws {
+        guard let source = CGEventSource(stateID: .hidSystemState)
+            ?? CGEventSource(stateID: .combinedSessionState)
+        else {
+            throw eventFailure("Could not create a keyboard event source for the repair selection.")
+        }
+        source.localEventsSuppressionInterval = 0
+        for _ in 0..<times {
+            guard
+                let down = CGEvent(keyboardEventSource: source, virtualKey: keyCodeLeftArrow, keyDown: true),
+                let up = CGEvent(keyboardEventSource: source, virtualKey: keyCodeLeftArrow, keyDown: false)
+            else {
+                throw eventFailure("Could not create the repair selection keystrokes.")
+            }
+            down.flags = .maskShift
+            up.flags = .maskShift
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
         }
     }
 

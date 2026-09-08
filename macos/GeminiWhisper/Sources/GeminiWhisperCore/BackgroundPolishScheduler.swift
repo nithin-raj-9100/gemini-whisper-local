@@ -45,6 +45,13 @@ struct BackgroundPolishScheduler {
         return max(contentDelay, nextAllowedAt - now, 0)
     }
 
+    /// Budget-only admission, without the stability/new-word content gate.
+    /// The stop edge is the last chance to speculate, so a small edit still
+    /// earns a call, but a throttled or already-failed input never does.
+    func admitsStopEdge(_ input: String) -> Bool {
+        !throttled && jobs < policy.maximumJobs && !input.isEmpty && !failedInputs.contains(input)
+    }
+
     mutating func started(_ input: String, now: TimeInterval) {
         jobs += 1
         lastInput = input

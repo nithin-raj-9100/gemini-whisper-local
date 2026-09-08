@@ -342,7 +342,36 @@ public final class DictationSession: @unchecked Sendable {
             stopPrepared = true
             stopBeganAt = stopBeganAt ?? time ?? ProcessInfo.processInfo.systemUptime
             stabilityTask?.cancel()
+            startStopEdgeSpeculation()
         }
+    }
+
+    /// The stop gesture is followed by the audio tail and Live finalization, during
+    /// which the transcript usually does not change. Polishing the stop-edge draft
+    /// there converts that wait into a head start: if the final input matches, the
+    /// call is awaited instead of started; if late words arrive, it still becomes
+    /// the previous-candidate context for revise() rather than being wasted.
+    private func startStopEdgeSpeculation() {
+        guard let intelligence, !discarded, options.speculativeIntelligence,
+              polishEnabled, speculativePolish == nil else { return }
+        let input = draft
+        guard !input.isEmpty, completedCandidate?.input != input,
+              scheduler.admitsStopEdge(input) else { return }
+        scheduler.started(input, now: ProcessInfo.processInfo.systemUptime)
+        let id = UUID()
+        let sourceRevision = revision
+        polishStarts += 1
+        options.emit(.warning(code: "polish_start", message: "session=\(sessionID) kind=stop_edge revision=\(sourceRevision) backgroundJobs=\(scheduler.jobs)"))
+        let task = Task<Result<IntelligenceResult, Error>, Never> { [weak self] in
+            let result: Result<IntelligenceResult, Error>
+            do {
+                try Task.checkCancellation()
+                result = .success(try await intelligence.polishBackground(input))
+            } catch { result = .failure(error) }
+            self?.speculationFinished(id: id, input: input, revision: sourceRevision, result: result)
+            return result
+        }
+        speculativePolish = SpeculativePolish(id: id, input: input, revision: sourceRevision, task: task)
     }
 
     private func updateRevision() {
@@ -432,6 +461,15 @@ public final class DictationSession: @unchecked Sendable {
                 return (input, intelligence, matching, completedCandidate)
             }
             guard let (input, intelligence, pending, candidate) = work else { return }
+            // Announce the settled raw transcript before blocking on polish, so a
+            // consumer can insert it now and repair in place when polish lands.
+            if intelligence != nil, !input.isEmpty {
+                lock.withLock {
+                    guard !discarded else { return }
+                    let ready = candidate?.input == input
+                    if !ready { options.emit(.provisional(text: input)) }
+                }
+            }
             var result: IntelligenceResult?
             var reused = false
             var outcome = "raw_disabled"

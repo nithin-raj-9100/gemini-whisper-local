@@ -90,6 +90,9 @@ public enum ServerEvent: Sendable, Equatable {
     case interim(text: String)
     case final(text: String)
     case polished(text: String, model: String, latencyMs: Int, speculative: Bool?, source: String = "")
+    /// Raw transcript is final but polish is still running. Consumers that can
+    /// correct already-inserted text may deliver this now and repair later.
+    case provisional(text: String)
     case warning(code: String, message: String)
     case timing(DictationTiming)
     case complete
@@ -108,6 +111,7 @@ public enum ServerEvent: Sendable, Equatable {
         case .interim: return "interim"
         case .final: return "final"
         case .polished: return "polished"
+        case .provisional: return "provisional"
         case .warning: return "warning"
         case .timing: return "timing"
         case .complete: return "complete"
