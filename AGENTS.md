@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 ## Project
 
 `gemini-whisper-local` is a native macOS menu-bar dictation app. **GeminiWhisper.app** captures
-16 kHz mono PCM16 from the microphone, streams it to **Gemini 3.5 Transcribe Live**, optionally
+16 kHz mono PCM16 from the microphone, streams it to **`gemini-3.5-transcribe-live`**, optionally
 polishes with `gemini-3.5-flash-lite`, and pastes into the focused app. Right Option toggles
 dictation; Escape cancels. Not an npm package or hosted service.
 
@@ -47,7 +47,7 @@ NSEvent monitors for Option taps (under 0.6s toggles), holds (0.6s or longer rec
 release), and Escape. Using Option as a modifier cancels that gesture without pasting.
 
 The polish pass overlaps Live finalization (speculative Flash-Lite). If polish fails or times out,
-the raw transcript is inserted. Audio is chunked to 100 ms frames (3,200 bytes). The app can
+the raw transcript is inserted. Audio is chunked to 40 ms frames (1,280 bytes). The app can
 optionally register itself as a login item (`SMAppService`).
 
 ## Security boundary
