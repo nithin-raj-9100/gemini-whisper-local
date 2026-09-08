@@ -70,7 +70,7 @@ public let AUDIO_CONTRACT = AudioContract(
     encoding: "pcm_s16le",
     sampleRate: 16_000,
     channels: 1,
-    chunkMilliseconds: 100
+    chunkMilliseconds: 40
 )
 
 public enum ClientCommand: Sendable, Equatable {

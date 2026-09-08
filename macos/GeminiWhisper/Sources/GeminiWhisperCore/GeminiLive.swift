@@ -5,8 +5,8 @@ public let GEMINI_LIVE_ENDPOINT =
 public let GEMINI_LIVE_MODEL = "models/gemini-3.5-transcribe-live"
 
 private let CONNECT_TIMEOUT_MS: UInt64 = 15_000
-private let FAST_FINISH_GRACE_MS: UInt64 = 1_200
-private let HARD_FINISH_TIMEOUT_MS: UInt64 = 3_500
+private let FAST_FINISH_GRACE_MS: UInt64 = 500
+private let HARD_FINISH_TIMEOUT_MS: UInt64 = 1_200
 private let SESSION_TIMEOUT_MS: UInt64 = 9 * 60 * 1000
 private let MAX_BUFFERED_AUDIO_BYTES = 16_000 * 2 * 10
 private let RACE_WINDOW_MS: Double = 800
@@ -227,11 +227,15 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             close()
             return
         }
-        let realtimeInput: [String: Any] =
-            options.config.vad == .manual
-                ? ["activityEnd": [String: Any]()]
-                : ["audioStreamEnd": true]
-        if !hybridEndPending { try sendJSON(["realtimeInput": realtimeInput]) }
+        // audioStreamEnd is the only signal documented to bypass the server-side
+        // silence wait. Manual VAD also needs activityEnd to close its segment,
+        // and that path is known to hang without a following audioStreamEnd.
+        if !hybridEndPending {
+            if options.config.vad == .manual {
+                try sendJSON(["realtimeInput": ["activityEnd": [String: Any]()]])
+            }
+            try sendJSON(["realtimeInput": ["audioStreamEnd": true]])
+        }
         finishTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(FAST_FINISH_GRACE_MS))
             guard !Task.isCancelled else { return }

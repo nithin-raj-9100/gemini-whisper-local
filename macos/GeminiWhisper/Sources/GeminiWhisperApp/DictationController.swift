@@ -26,6 +26,7 @@ final class DictationController {
     let capture = MicrophoneCapture()
 
     private var isStreamingAudio = false
+    private var lastVoicedUptime: TimeInterval = 0
     private var audioStream: PCMDeliveryStream?
     private var preCapture = false
     private var heldGestureActive = false
@@ -200,8 +201,12 @@ final class DictationController {
         preCapture = false
         startSession(apiKey: apiKey)
         let generation = sessionGeneration
+        lastVoicedUptime = ProcessInfo.processInfo.systemUptime
         audioStream?.commit { [weak self] block in
             guard let self, self.sessionGeneration == generation, !self.cancelled else { return }
+            if pcmRootMeanSquare(block.pcm) >= PCM_VOICED_RMS_THRESHOLD {
+                self.lastVoicedUptime = ProcessInfo.processInfo.systemUptime
+            }
             do { try self.session?.sendAudio(block.pcm) }
             catch { self.handleAudioSendFailure(AppLog.redact(error.localizedDescription)) }
         }
@@ -246,7 +251,12 @@ final class DictationController {
         SoundPlayer.play(.pop)
         AppLog.line("Option: stopping and polishing dictation.")
         session?.prepareToStop(at: stopRequestedUptime)
-        let tailNs = UInt64(max(0, settings.stopTailMs)) * 1_000_000
+        // The tail exists to catch words still in flight at key-release. Silence
+        // already observed since the last voiced frame counts against it, so a
+        // release after a natural pause pays nothing.
+        let tailMs = max(0, settings.stopTailMs)
+        let silentMs = Int(max(0, stopRequestedUptime - lastVoicedUptime) * 1000)
+        let tailNs = UInt64(max(0, tailMs - silentMs)) * 1_000_000
         let generation = sessionGeneration
         Task {
             if tailNs > 0 {
@@ -257,7 +267,7 @@ final class DictationController {
             let boundary = await self.audioStream?.drain() ?? 0
             guard self.sessionGeneration == generation, !self.cancelled else { return }
             self.isStreamingAudio = false
-            AppLog.line("Audio drained through sample \(boundary), \(Int(timeIntervalSinceAbsoluteTime(self.stopRequestedAt) * 1000)) ms after stop.")
+            AppLog.line("Audio drained through sample \(boundary), \(Int(timeIntervalSinceAbsoluteTime(self.stopRequestedAt) * 1000)) ms after stop (tail \(tailNs / 1_000_000) of \(tailMs) ms, \(silentMs) ms already silent).")
             do {
                 try self.session?.flush()
                 try self.session?.stop()

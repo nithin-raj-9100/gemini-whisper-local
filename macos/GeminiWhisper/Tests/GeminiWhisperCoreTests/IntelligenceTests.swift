@@ -38,7 +38,7 @@ struct IntelligenceTests {
         #expect(result.attempts == 2)
     }
 
-    @Test func usesFlashLiteWithMinimalThinkingAndReturnsOnlyModelText() async throws {
+    @Test func usesFlashLiteWithThinkingDisabledAndReturnsOnlyModelText() async throws {
         nonisolated(unsafe) var requestURL = ""
         nonisolated(unsafe) var request: URLRequest?
         let intelligence = createTranscriptIntelligence(
@@ -65,7 +65,9 @@ struct IntelligenceTests {
         #expect(requestURL.contains("/gemini-3.5-flash-lite:generateContent"))
         #expect(!requestURL.contains("test-only"))
         #expect(request?.value(forHTTPHeaderField: "x-goog-api-key") == "test-only")
-        #expect(thinking["thinkingLevel"] as? String == "MINIMAL")
+        #expect(thinking["thinkingBudget"] as? Int == 0)
+        // thinkingLevel and thinkingBudget are mutually exclusive; sending both is rejected.
+        #expect(thinking["thinkingLevel"] == nil)
         #expect(thinking["includeThoughts"] as? Bool == false)
         #expect((parts[0]["text"] as? String)?.contains("ALWAYS format the items") == true)
         #expect((parts[0]["text"] as? String)?.contains("@src/app.tsx") == true)

@@ -184,6 +184,11 @@ struct GeminiLiveTests {
         #expect(jsonEquals(jsonObject(socket.sent[4]), [
             "realtimeInput": ["activityEnd": [String: Any]()],
         ]))
+        // activityEnd alone is documented to hang; audioStreamEnd is what bypasses
+        // the server-side silence wait, so manual VAD must send both on stop.
+        #expect(jsonEquals(jsonObject(socket.sent[5]), [
+            "realtimeInput": ["audioStreamEnd": true],
+        ]))
 
         socket.simulateJSON([
             "serverContent": [
@@ -437,7 +442,8 @@ struct GeminiLiveTests {
         await Task.yield()
         try transcriber.finish()
 
-        try await Task.sleep(for: .milliseconds(1_500))
+        // Between the fast grace warning and the hard fallback: late words still win.
+        try await Task.sleep(for: .milliseconds(800))
         #expect(!events.contains { $0.typeName == "complete" })
         socket.simulateJSON([
             "serverContent": ["inputTranscription": ["text": "Words from the HUD including the last words"]],

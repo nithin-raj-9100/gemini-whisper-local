@@ -13,6 +13,22 @@ public func validatePcmChunk(_ chunk: Data) throws {
     }
 }
 
+/// Normalized RMS of a PCM16 little-endian buffer, 0...1.
+public func pcmRootMeanSquare(_ pcm: Data) -> Double {
+    let bytes = [UInt8](pcm)
+    guard bytes.count >= 2 else { return 0 }
+    var energy = 0.0
+    for index in stride(from: 0, to: bytes.count - 1, by: 2) {
+        let sample = Double(Int16(bitPattern: UInt16(bytes[index]) | UInt16(bytes[index + 1]) << 8)) / 32768
+        energy += sample * sample
+    }
+    return (energy / Double(bytes.count / 2)).squareRoot()
+}
+
+/// Energy floor separating speech from room tone, shared by the stop-tail
+/// shortcut and the hybrid endpointer so they never disagree about silence.
+public let PCM_VOICED_RMS_THRESHOLD = 0.002
+
 public final class PcmChunker {
     private var pending = Data()
 

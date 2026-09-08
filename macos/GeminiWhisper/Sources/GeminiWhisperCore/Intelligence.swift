@@ -185,7 +185,10 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
             "systemInstruction": ["parts": [["text": instruction]]],
             "contents": [["role": "user", "parts": [["text": input]]]],
             "generationConfig": [
-                "thinkingConfig": ["thinkingLevel": "MINIMAL", "includeThoughts": false],
+                // thinkingBudget 0, not thinkingLevel MINIMAL: MINIMAL still admits a
+                // reasoning path, and reasoning TTFT on this tier is ~50x non-reasoning.
+                // Sending both keys is rejected by the API, so only this one may appear.
+                "thinkingConfig": ["thinkingBudget": 0, "includeThoughts": false],
                 // Output tracks input length (polish compresses); small cap keeps
                 // decoding fast, scaled up only for very long dictations.
                 "maxOutputTokens": outputTokenCap(for: input),
