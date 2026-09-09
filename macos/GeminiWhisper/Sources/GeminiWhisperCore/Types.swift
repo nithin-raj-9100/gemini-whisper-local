@@ -129,8 +129,8 @@ public struct IntelligenceResult: Sendable, Equatable {
     public var text: String
     public var model: String
     public var latencyMs: Int
-    /// Thinking tokens the model actually billed. Must stay 0: thinkingBudget is
-    /// set to 0 and a non-zero value here means the request silently reasoned.
+    /// Thinking tokens the model actually billed. Expected to stay 0 under
+    /// thinkingLevel "minimal"; a non-zero value means the request reasoned anyway.
     public var thoughtsTokens: Int = 0
     /// HTTP attempts made for this call (0 when no request was sent).
     public var attempts: Int

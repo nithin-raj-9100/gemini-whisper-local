@@ -254,10 +254,10 @@ public struct GeminiTranscriptIntelligence: TranscriptIntelligence {
             "systemInstruction": ["parts": [["text": instruction]]],
             "contents": [["role": "user", "parts": [["text": input]]]],
             "generationConfig": [
-                // thinkingBudget 0, not thinkingLevel MINIMAL: MINIMAL still admits a
-                // reasoning path, and reasoning TTFT on this tier is ~50x non-reasoning.
-                // Sending both keys is rejected by the API, so only this one may appear.
-                "thinkingConfig": ["thinkingBudget": 0, "includeThoughts": false],
+                // thinkingLevel, not thinkingBudget: the budget field is Gemini 2.5-era
+                // and gemini-3.5-flash-lite rejects it with 400 INVALID_ARGUMENT at any
+                // value. The two keys are mutually exclusive, so only this one may appear.
+                "thinkingConfig": ["thinkingLevel": "minimal", "includeThoughts": false],
                 // Output tracks input length (polish compresses); small cap keeps
                 // decoding fast, scaled up only for very long dictations.
                 "maxOutputTokens": outputTokenCap(for: input),
@@ -451,9 +451,9 @@ private func retryDelayMs(response: HTTPURLResponse?, attempt: Int) -> UInt64 {
     return base
 }
 
-/// thinkingBudget 0 should make this always 0. Surfaced so a silent regression
-/// (or a model that ignores the budget) shows up in the log instead of only as
-/// unexplained latency.
+/// thinkingLevel "minimal" should keep this at 0, but the docs are explicit that
+/// minimal does not guarantee no reasoning. Surfaced so a model that starts
+/// reasoning shows up in the log instead of only as unexplained latency.
 private func generateContentThoughtsTokens(_ payload: Any) -> Int {
     guard let object = payload as? [String: Any],
           let usage = object["usageMetadata"] as? [String: Any]
