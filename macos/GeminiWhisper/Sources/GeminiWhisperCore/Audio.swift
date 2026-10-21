@@ -1,6 +1,8 @@
 import Foundation
 
 public let PCM_BYTES_PER_FRAME = 2
+/// 16 kHz mono PCM16: 32 bytes per millisecond.
+public let PCM_BYTES_PER_MILLISECOND = AUDIO_CONTRACT.sampleRate * PCM_BYTES_PER_FRAME / 1000
 public let PCM_CHUNK_BYTES =
     (AUDIO_CONTRACT.sampleRate * AUDIO_CONTRACT.chunkMilliseconds * PCM_BYTES_PER_FRAME) / 1000
 
@@ -15,14 +17,19 @@ public func validatePcmChunk(_ chunk: Data) throws {
 
 /// Normalized RMS of a PCM16 little-endian buffer, 0...1.
 public func pcmRootMeanSquare(_ pcm: Data) -> Double {
-    let bytes = [UInt8](pcm)
-    guard bytes.count >= 2 else { return 0 }
-    var energy = 0.0
-    for index in stride(from: 0, to: bytes.count - 1, by: 2) {
-        let sample = Double(Int16(bitPattern: UInt16(bytes[index]) | UInt16(bytes[index + 1]) << 8)) / 32768
-        energy += sample * sample
+    let samples = pcm.count / 2
+    guard samples > 0 else { return 0 }
+    // Runs for every 40 ms frame in several places; read in place instead of
+    // copying the frame into a temporary array.
+    let energy = pcm.withUnsafeBytes { raw -> Double in
+        var sum = 0.0
+        for index in 0..<samples {
+            let sample = Double(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: index * 2, as: Int16.self))) / 32768
+            sum += sample * sample
+        }
+        return sum
     }
-    return (energy / Double(bytes.count / 2)).squareRoot()
+    return (energy / Double(samples)).squareRoot()
 }
 
 /// Energy floor separating speech from room tone, shared by the stop-tail

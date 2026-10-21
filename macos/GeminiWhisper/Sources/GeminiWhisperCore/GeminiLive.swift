@@ -7,13 +7,23 @@ public let GEMINI_LIVE_MODEL = "models/gemini-3.5-transcribe-live"
 private let CONNECT_TIMEOUT_MS: UInt64 = 15_000
 private let FAST_FINISH_GRACE_MS: UInt64 = 500
 private let HARD_FINISH_TIMEOUT_MS: UInt64 = 1_200
+/// Last-resort local limit. DictationSession rotates to a fresh Live session
+/// well before this, at a pause, so a long dictation never reaches it.
 private let SESSION_TIMEOUT_MS: UInt64 = 9 * 60 * 1000
-private let MAX_BUFFERED_AUDIO_BYTES = 16_000 * 2 * 10
+/// Audio held while (re)connecting. DictationSession records every frame
+/// independently, so overflowing this degrades Live but never loses audio.
+private let MAX_BUFFERED_AUDIO_BYTES = 16_000 * 2 * 30
 private let RACE_WINDOW_MS: Double = 800
 private let MAX_RECONNECT_ATTEMPTS = 5
-private let RECONNECT_DELAY_MS: UInt64 = 200
+/// Exponential reconnect backoff: 200, 400, 800, 1600, 3200 ms.
+private let RECONNECT_BASE_DELAY_MS: UInt64 = 200
+private let RECONNECT_MAX_DELAY_MS: UInt64 = 3_200
+/// How long a reconnect waits for the network path to come back.
+private let NETWORK_WAIT_MS: UInt64 = 30_000
+/// An identical final this soon after the previous one is a server resend.
+private let RESEND_WINDOW_MS: Double = 2_000
 
-public protocol LiveTranscriber: AnyObject {
+public protocol LiveTranscriber: AnyObject, Sendable {
     func connect() async throws
     func sendAudio(_ chunk: Data) throws
     func finish() throws
@@ -25,17 +35,21 @@ public struct GeminiLiveOptions {
     public var config: TranscriptionConfig
     public var emit: (ServerEvent) -> Void
     public var webSocketFactory: GeminiWebSocketFactory?
+    /// nil uses the system path monitor (NWPathMonitor on macOS).
+    public var network: (any NetworkPathMonitoring)?
 
     public init(
         apiKey: String,
         config: TranscriptionConfig,
         emit: @escaping (ServerEvent) -> Void,
-        webSocketFactory: GeminiWebSocketFactory? = nil
+        webSocketFactory: GeminiWebSocketFactory? = nil,
+        network: (any NetworkPathMonitoring)? = nil
     ) {
         self.apiKey = apiKey
         self.config = config
         self.emit = emit
         self.webSocketFactory = webSocketFactory
+        self.network = network
     }
 }
 
@@ -69,6 +83,38 @@ public func buildGeminiSetup(_ config: TranscriptionConfig) -> [String: Any] {
     return ["setup": setup]
 }
 
+/// Gemini statuses that a reconnect or retry cannot fix.
+let NON_RETRYABLE_GEMINI_STATUSES: Set<String> = [
+    "INVALID_ARGUMENT", "PERMISSION_DENIED", "UNAUTHENTICATED", "NOT_FOUND", "FAILED_PRECONDITION",
+]
+
+/// True when an error or close reason says the API key itself was rejected.
+/// Retrying, reconnecting, or falling back to another endpoint with the same key
+/// cannot succeed, so callers should fail fast instead.
+public func isAuthenticationFailure(_ text: String) -> Bool {
+    let lowered = text.lowercased()
+    return [
+        "api key not valid", "api_key_invalid", "invalid api key", "api key expired",
+        "permission_denied", "permission denied", "unauthenticated",
+    ].contains { lowered.contains($0) }
+}
+
+/// Protobuf Duration JSON ("12.5s") or a bare number of seconds.
+func parseDurationMilliseconds(_ value: Any?) -> Int {
+    if let text = value as? String {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        let number = trimmed.hasSuffix("s") ? String(trimmed.dropLast()) : trimmed
+        return Double(number).map { Int(($0 * 1000).rounded()) } ?? 0
+    }
+    if let number = value as? NSNumber { return Int((number.doubleValue * 1000).rounded()) }
+    if let object = jsonObject(value) {
+        let seconds = (object["seconds"] as? NSNumber)?.doubleValue ?? 0
+        let nanos = (object["nanos"] as? NSNumber)?.doubleValue ?? 0
+        return Int((seconds * 1000 + nanos / 1_000_000).rounded())
+    }
+    return 0
+}
+
 public func parseGeminiMessage(_ value: Any) -> [ServerEvent] {
     guard let object = jsonObject(value) else { return [] }
     var events: [ServerEvent] = []
@@ -88,8 +134,13 @@ public func parseGeminiMessage(_ value: Any) -> [ServerEvent] {
         } else {
             code = "gemini_error"
         }
-        events.append(.error(code: code, message: redactApiKeys(message), retryable: true))
+        let permanent = NON_RETRYABLE_GEMINI_STATUSES.contains(code) || isAuthenticationFailure(message)
+        events.append(.error(code: code, message: redactApiKeys(message), retryable: !permanent))
         return events
+    }
+
+    if let goAway = jsonObject(object["goAway"]) {
+        events.append(.goAway(timeLeftMs: parseDurationMilliseconds(goAway["timeLeft"])))
     }
 
     guard let content = jsonObject(object["serverContent"]) else { return events }
@@ -110,12 +161,21 @@ public func parseGeminiMessage(_ value: Any) -> [ServerEvent] {
     return events
 }
 
+/// Gemini Live client. Socket callbacks, timer tasks, and caller methods may run on
+/// different threads, so every entry point runs under one recursive lock. Events
+/// are queued while the lock is held and delivered, in order, only after it is
+/// released: the consumer may take its own lock and call back in without
+/// deadlocking against a socket callback.
 public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     private enum State {
         case idle, connecting, ready, finishing, closed
     }
 
     private let options: GeminiLiveOptions
+    private let lock = NSRecursiveLock()
+    private var depth = 0
+    private var outbox: [ServerEvent] = []
+    private var emitting = false
     private var socket: (any GeminiWebSocket)?
     private var state: State = .idle
     private var queuedAudio: [Data] = []
@@ -134,6 +194,10 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
     private var latestInterim = ""
     private var interimAccumulator = InterimTranscriptAccumulator()
     private var lastFinal = ""
+    private var lastFinalAt: Double = 0
+    /// Speech-energy audio sent since the last final. A final that repeats earlier
+    /// text is only treated as new speech when enough new audio could carry it.
+    private var voicedMsSinceFinal = 0
     private var hasTranscript = false
     private var connectTimeoutTask: Task<Void, Never>?
     private var finishTimeoutTask: Task<Void, Never>?
@@ -148,106 +212,169 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         apiKey: String,
         config: TranscriptionConfig,
         emit: @escaping (ServerEvent) -> Void,
-        webSocketFactory: GeminiWebSocketFactory? = nil
+        webSocketFactory: GeminiWebSocketFactory? = nil,
+        network: (any NetworkPathMonitoring)? = nil
     ) {
         self.init(options: GeminiLiveOptions(
             apiKey: apiKey,
             config: config,
             emit: emit,
-            webSocketFactory: webSocketFactory
+            webSocketFactory: webSocketFactory,
+            network: network
         ))
     }
 
     public func connect() async throws {
-        guard state == .idle else {
-            throw TranscriptionError("Session already started.")
-        }
-        state = .connecting
-        try await withCheckedThrowingContinuation { continuation in
-            connectContinuation = continuation
-            openSocket()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            perform {
+                guard state == .idle else {
+                    continuation.resume(throwing: TranscriptionError("Session already started."))
+                    return
+                }
+                state = .connecting
+                connectContinuation = continuation
+                openSocket()
+            }
         }
     }
 
     public func sendAudio(_ chunk: Data) throws {
         try validatePcmChunk(chunk)
-        if state == .finishing || state == .closed {
-            return
-        }
-        if state != .ready {
-            try queueAudio(chunk)
-            return
-        }
-
-        // A URLSession transport failure can change the wrapper state before its
-        // close delegate callback arrives. Buffer this frame and start recovery
-        // here as well; otherwise every microphone frame is rejected during that
-        // callback gap and the UI appears to keep listening with a frozen draft.
-        guard socket?.readyState == .open else {
-            try queueAudio(chunk)
-            recoverUnavailableSocket()
-            if state == .closed {
-                throw TranscriptionError("Gemini Live connection could not be restored.")
+        try perform {
+            if state == .finishing || state == .closed {
+                return
             }
-            return
+            if state != .ready {
+                try queueAudio(chunk)
+                return
+            }
+
+            // A URLSession transport failure can change the wrapper state before its
+            // close delegate callback arrives. Buffer this frame and start recovery
+            // here as well; otherwise every microphone frame is rejected during that
+            // callback gap and the UI appears to keep listening with a frozen draft.
+            guard socket?.readyState == .open else {
+                try queueAudio(chunk)
+                recoverUnavailableSocket()
+                if state == .closed {
+                    throw TranscriptionError("Gemini Live connection could not be restored.")
+                }
+                return
+            }
+            lastAudioSentAt = nowMilliseconds()
+            try sendAudioFrame(chunk)
         }
-        lastAudioSentAt = nowMilliseconds()
-        try sendAudioFrame(chunk)
     }
 
     public func finish() throws {
-        if state == .connecting {
-            finishRequested = true
-            return
-        }
-        if state == .finishing {
-            return
-        }
-        if state == .closed {
-            if emitBufferedComplete(
-                code: "gemini_connection_closed",
-                message: "Gemini Live closed before stop; using buffered transcript."
-            ) {
+        try perform {
+            if state == .connecting {
+                finishRequested = true
                 return
             }
-            throw TranscriptionError("The transcription session is not ready.")
-        }
-        guard state == .ready else {
-            throw TranscriptionError("The transcription session is not ready.")
-        }
-        state = .finishing
-        options.emit(.speechEnd)
-        // Nothing pending: the server already turned everything after the last
-        // audio frame (or no audio was sent). Complete locally instead of a
-        // network round trip. Applies to manual push-to-talk too: an
-        // activityEnd acknowledging already-finalized audio buys nothing.
-        if !hybridEndPending && (lastAudioSentAt == 0 || lastTurnCompleteAt - lastAudioSentAt > RACE_WINDOW_MS)
-        {
-            emitComplete()
-            close()
-            return
-        }
-        // audioStreamEnd is the only signal documented to bypass the server-side
-        // silence wait. Manual VAD also needs activityEnd to close its segment,
-        // and that path is known to hang without a following audioStreamEnd.
-        if !hybridEndPending {
-            if options.config.vad == .manual {
-                try sendJSON(["realtimeInput": ["activityEnd": [String: Any]()]])
+            if state == .finishing {
+                return
             }
-            try sendJSON(["realtimeInput": ["audioStreamEnd": true]])
-        }
-        finishTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(FAST_FINISH_GRACE_MS))
-            guard !Task.isCancelled else { return }
-            self?.handleFastFinishGrace()
-            guard self?.state == .finishing else { return }
-            try? await Task.sleep(for: .milliseconds(HARD_FINISH_TIMEOUT_MS - FAST_FINISH_GRACE_MS))
-            guard !Task.isCancelled else { return }
-            self?.handleHardFinishTimeout()
+            if state == .closed {
+                if emitBufferedComplete(
+                    code: "gemini_connection_closed",
+                    message: "Gemini Live closed before stop; using buffered transcript."
+                ) {
+                    return
+                }
+                throw TranscriptionError("The transcription session is not ready.")
+            }
+            guard state == .ready else {
+                throw TranscriptionError("The transcription session is not ready.")
+            }
+            state = .finishing
+            emit(.speechEnd)
+            // Nothing pending: the server already turned everything after the last
+            // audio frame (or no audio was sent). Complete locally instead of a
+            // network round trip. Applies to manual push-to-talk too: an
+            // activityEnd acknowledging already-finalized audio buys nothing.
+            if !hybridEndPending && (lastAudioSentAt == 0 || lastTurnCompleteAt - lastAudioSentAt > RACE_WINDOW_MS)
+            {
+                emitComplete()
+                closeLocked()
+                return
+            }
+            // audioStreamEnd is the only signal documented to bypass the server-side
+            // silence wait. Manual VAD also needs activityEnd to close its segment,
+            // and that path is known to hang without a following audioStreamEnd.
+            if !hybridEndPending {
+                if options.config.vad == .manual {
+                    try sendJSON(["realtimeInput": ["activityEnd": [String: Any]()]])
+                }
+                try sendJSON(["realtimeInput": ["audioStreamEnd": true]])
+            }
+            finishTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(FAST_FINISH_GRACE_MS))
+                guard !Task.isCancelled, let self else { return }
+                let stillFinishing = self.perform { () -> Bool in
+                    self.handleFastFinishGrace()
+                    return self.state == .finishing
+                }
+                guard stillFinishing else { return }
+                try? await Task.sleep(for: .milliseconds(HARD_FINISH_TIMEOUT_MS - FAST_FINISH_GRACE_MS))
+                guard !Task.isCancelled else { return }
+                self.perform { self.handleHardFinishTimeout() }
+            }
         }
     }
 
     public func close() {
+        perform { closeLocked() }
+    }
+
+    // MARK: - Locking
+
+    /// Runs `body` under the lock. When the outermost call on this thread returns,
+    /// queued events are delivered without the lock held.
+    private func perform<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        depth += 1
+        defer {
+            depth -= 1
+            let outermost = depth == 0
+            lock.unlock()
+            if outermost { drainOutbox() }
+        }
+        return try body()
+    }
+
+    /// Queue an event. Callers hold the lock.
+    private func emit(_ event: ServerEvent) {
+        outbox.append(event)
+    }
+
+    /// Delivers queued events in order from one thread at a time. A thread that
+    /// finds another already delivering leaves its events for that thread.
+    private func drainOutbox() {
+        while true {
+            lock.lock()
+            if emitting || outbox.isEmpty {
+                lock.unlock()
+                return
+            }
+            emitting = true
+            let batch = outbox
+            outbox.removeAll()
+            lock.unlock()
+            for event in batch { options.emit(event) }
+            lock.lock()
+            emitting = false
+            lock.unlock()
+        }
+    }
+
+    private var networkAvailable: Bool {
+        (options.network ?? defaultNetworkPathMonitor()).isSatisfied
+    }
+
+    // MARK: - Socket lifecycle (lock held)
+
+    private func closeLocked() {
         if state == .closed { return }
         state = .closed
         clearTimers()
@@ -267,45 +394,68 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         self.socket = socket
 
         socket.onOpen = { [weak self, weak socket] in
-            guard let self, let socket, socket === self.socket, self.state != .closed else { return }
-            try? self.sendJSON(buildGeminiSetup(self.options.config))
+            guard let self, let socket else { return }
+            self.perform {
+                guard socket === self.socket, self.state != .closed else { return }
+                try? self.sendJSON(buildGeminiSetup(self.options.config))
+            }
         }
         socket.onMessage = { [weak self, weak socket] text in
-            guard let self, let socket, socket === self.socket else { return }
-            self.onMessage(text)
+            guard let self, let socket else { return }
+            self.perform {
+                guard socket === self.socket else { return }
+                self.onMessage(text)
+            }
         }
         socket.onError = { [weak self, weak socket] in
-            guard let self, let socket, socket === self.socket else { return }
-            self.recoverUnavailableSocket()
+            guard let self, let socket else { return }
+            self.perform {
+                guard socket === self.socket else { return }
+                self.recoverUnavailableSocket()
+            }
         }
         socket.onClose = { [weak self, weak socket] code, reason in
-            guard let self, let socket, socket === self.socket else { return }
-            self.handleClose(code: code, reason: reason)
+            guard let self, let socket else { return }
+            self.perform {
+                guard socket === self.socket else { return }
+                self.handleClose(code: code, reason: reason)
+            }
         }
 
         connectTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(CONNECT_TIMEOUT_MS))
-            guard !Task.isCancelled else { return }
-            self?.closeSocketIfStillConnecting()
+            guard !Task.isCancelled, let self else { return }
+            self.perform { self.closeSocketIfStillConnecting() }
         }
     }
 
     private func handleClose(code: Int, reason: String) {
         let wasExpected = state == .closed
         let wasFinishing = state == .finishing || finishRequested
+        let permanent = code == 1008 || isAuthenticationFailure(reason)
         clearTimers()
         socket = nil
 
-        if !wasExpected, !wasFinishing, code != 1008, reconnectAttempts < MAX_RECONNECT_ATTEMPTS {
+        if !wasExpected, !wasFinishing, !permanent, reconnectAttempts < MAX_RECONNECT_ATTEMPTS {
+            let delay = min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS << UInt64(reconnectAttempts))
             reconnectAttempts += 1
             commitInterimFallback()
             state = .connecting
-            options.emit(.connecting)
+            emit(.connecting)
             reconnectTask = Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(RECONNECT_DELAY_MS))
-                guard !Task.isCancelled else { return }
-                if self?.state == .connecting {
-                    self?.openSocket()
+                try? await Task.sleep(for: .milliseconds(delay))
+                // A dead interface would fail every attempt instantly. Wait for a
+                // route instead of spending the attempts.
+                var waited: UInt64 = 0
+                while !Task.isCancelled, waited < NETWORK_WAIT_MS, self?.networkAvailable == false {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    waited += 250
+                }
+                guard !Task.isCancelled, let self else { return }
+                self.perform {
+                    if self.state == .connecting {
+                        self.openSocket()
+                    }
                 }
             }
             return
@@ -320,7 +470,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         let detail = sanitizeCloseReason(reason)
         let suffix = detail.isEmpty ? "" : ": \(detail)"
         if wasFinishing, hasTranscript || recovered {
-            options.emit(.warning(
+            emit(.warning(
                 code: "gemini_connection_closed",
                 message: "Gemini Live closed the session (code \(code))\(suffix); using buffered transcript."
             ))
@@ -329,7 +479,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         }
         if hasTranscript || recovered {
             // Keep the buffered transcript for Option-stop. Do not complete while still listening.
-            options.emit(.warning(
+            emit(.warning(
                 code: "gemini_connection_closed",
                 message: "Gemini Live closed the session (code \(code))\(suffix); dictation will use the buffered transcript when you stop."
             ))
@@ -338,7 +488,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         fail(
             code: "gemini_connection_closed",
             message: "Gemini Live closed the session (code \(code))\(suffix).",
-            retryable: code != 1008
+            retryable: !permanent
         )
     }
 
@@ -352,7 +502,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             parsed = try JSONSerialization.jsonObject(with: Data(trimmed.utf8))
         } catch {
             fail(code: "invalid_gemini_message", message: "Gemini returned an unreadable message.", retryable: true)
-            close()
+            closeLocked()
             return
         }
 
@@ -360,8 +510,8 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             if state == .closed { break }
             if event.typeName == "ready" {
                 onReady()
-                options.emit(event)
-                options.emit(.speechStart)
+                emit(event)
+                emit(.speechStart)
                 continue
             }
             if case .error(let code, let message, let retryable) = event {
@@ -369,7 +519,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                     continue
                 }
                 fail(code: code, message: message, retryable: retryable)
-                close()
+                closeLocked()
                 continue
             }
             if event.typeName == "complete" {
@@ -379,7 +529,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                 hybridEndPending = false
                 if options.config.vad == .hybrid {
                     lastFinal = ""
-                    options.emit(.turnBoundary)
+                    emit(.turnBoundary)
                 }
                 if state == .finishing {
                     if acknowledgedHybridEnd, audioSequence > hybridEndSequence {
@@ -388,7 +538,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                         try? sendJSON(["realtimeInput": ["audioStreamEnd": true]])
                     } else {
                         emitComplete()
-                        close()
+                        closeLocked()
                     }
                 }
                 continue
@@ -396,7 +546,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             if case .interim(let text) = event {
                 let merged = interimAccumulator.accept(text)
                 latestInterim = merged
-                options.emit(.interim(text: merged))
+                emit(.interim(text: merged))
                 continue
             }
             if case .final(let text) = event {
@@ -406,26 +556,26 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
                 interimAccumulator.reset()
                 latestInterim = ""
                 // Drop server resends of text already delivered: without this,
-                // Session/Controller append a second copy of the same chunk.
-                let normNew = normalizeTranscript(fullText)
-                let normLast = normalizeTranscript(lastFinal)
-                if !normNew.isEmpty, !normLast.isEmpty, normNew == normLast || normLast.contains(normNew) {
+                // Session/Controller append a second copy of the same chunk. A
+                // repeat backed by new speech audio is kept: it was said again.
+                if isResend(fullText) {
                     hasTranscript = true
                     if state == .finishing, !hybridEndPending {
                         emitComplete()
-                        close()
+                        closeLocked()
                     }
                     continue
                 }
-                lastFinal = fullText
-                hasTranscript = true
-                options.emit(.final(text: fullText))
+                recordFinal(fullText)
+                emit(.final(text: fullText))
                 if state == .finishing, !hybridEndPending {
                     emitComplete()
-                    close()
+                    closeLocked()
                 }
                 continue
             }
+            // goAway and anything else pass through for the session to act on.
+            emit(event)
         }
     }
 
@@ -452,13 +602,15 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
 
         sessionTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(SESSION_TIMEOUT_MS))
-            guard !Task.isCancelled else { return }
-            self?.options.emit(.error(
-                code: "session_limit",
-                message: "The local session reached its nine-minute safety limit.",
-                retryable: true
-            ))
-            self?.close()
+            guard !Task.isCancelled, let self else { return }
+            self.perform {
+                self.emit(.error(
+                    code: "session_limit",
+                    message: "The local session reached its nine-minute safety limit.",
+                    retryable: true
+                ))
+                self.closeLocked()
+            }
         }
 
         if finishRequested {
@@ -477,6 +629,9 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             ],
         ])
         audioSequence += 1
+        if pcmRootMeanSquare(chunk) >= PCM_VOICED_RMS_THRESHOLD {
+            voicedMsSinceFinal += chunk.count / PCM_BYTES_PER_MILLISECOND
+        }
         if options.config.vad == .hybrid, state == .ready,
            localEndpoint.accept(chunk), !hybridEndPending {
             try sendJSON(["realtimeInput": ["audioStreamEnd": true]])
@@ -487,7 +642,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
 
     private func queueAudio(_ chunk: Data) throws {
         if queuedBytes + chunk.count > MAX_BUFFERED_AUDIO_BYTES {
-            throw TranscriptionError("Audio queue exceeded 10 seconds while Gemini was reconnecting.")
+            throw TranscriptionError("Audio queue exceeded 30 seconds while Gemini was reconnecting.")
         }
         queuedAudio.append(chunk)
         queuedBytes += chunk.count
@@ -517,22 +672,43 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         socket.send(text)
     }
 
+    private func recordFinal(_ text: String) {
+        lastFinal = text
+        lastFinalAt = nowMilliseconds()
+        voicedMsSinceFinal = 0
+        hasTranscript = true
+    }
+
+    /// A final that repeats the previous one is a server resend unless enough new
+    /// speech audio arrived to have said it again.
+    private func isResend(_ text: String) -> Bool {
+        let normNew = normalizeTranscript(text)
+        let normLast = normalizeTranscript(lastFinal)
+        guard !normNew.isEmpty, !normLast.isEmpty else { return false }
+        let freshSpeech = newSpeechLikely(voicedMs: voicedMsSinceFinal, incoming: text)
+        if normNew == normLast {
+            return nowMilliseconds() - lastFinalAt < RESEND_WINDOW_MS || !freshSpeech
+        }
+        return !freshSpeech && normalizedTranscriptContains(haystack: lastFinal, needle: text)
+    }
+
     @discardableResult
     private func commitInterimFallback() -> Bool {
         let text = latestInterim.trimmingCharacters(in: .whitespacesAndNewlines)
         interimAccumulator.reset()
         latestInterim = ""
+        // Echo guard: never promote interim the session already holds as a
+        // final (exact or contained) unless new speech audio backs it. Otherwise
+        // the fallback + the real final land as two copies of the same words on stop.
+        if text.isEmpty { return false }
         let normText = normalizeTranscript(text)
         let normLast = normalizeTranscript(lastFinal)
-        // Echo guard: never promote interim the session already holds as a
-        // final (exact or contained). Otherwise the fallback + the real final
-        // land as two copies of the same words on stop.
-        if text.isEmpty || normText == normLast || (!normLast.isEmpty && normLast.contains(normText)) {
+        let freshSpeech = newSpeechLikely(voicedMs: voicedMsSinceFinal, incoming: text)
+        if !freshSpeech, normText == normLast || normalizedTranscriptContains(haystack: lastFinal, needle: text) {
             return false
         }
-        lastFinal = text
-        hasTranscript = true
-        options.emit(.final(text: text))
+        recordFinal(text)
+        emit(.final(text: text))
         return true
     }
 
@@ -542,13 +718,13 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         let error = TranscriptionError(message)
         connectContinuation?.resume(throwing: error)
         connectContinuation = nil
-        options.emit(.error(code: code, message: message, retryable: retryable))
+        emit(.error(code: code, message: message, retryable: retryable))
     }
 
     private func emitComplete() {
         if completeEmitted { return }
         completeEmitted = true
-        options.emit(.complete)
+        emit(.complete)
     }
 
     @discardableResult
@@ -557,32 +733,32 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
         let recovered = commitInterimFallback()
         guard hasTranscript || recovered else { return false }
         if state != .finishing, state != .closed {
-            options.emit(.speechEnd)
+            emit(.speechEnd)
         }
-        options.emit(.warning(code: code, message: message))
+        emit(.warning(code: code, message: message))
         emitComplete()
-        close()
+        closeLocked()
         return true
     }
 
     private func handleFastFinishGrace() {
         guard state == .finishing, !completeEmitted else { return }
         // An interim is not an acknowledgment that the server processed the last audio.
-        options.emit(.warning(code: "finalization_wait", message: "Still waiting for final audio acknowledgment."))
+        emit(.warning(code: "finalization_wait", message: "Still waiting for final audio acknowledgment."))
     }
 
     private func handleHardFinishTimeout() {
         guard state == .finishing, !completeEmitted else { return }
         let lateInterim = commitInterimFallback()
         if hasTranscript {
-            options.emit(.warning(
+            emit(.warning(
                 code: "finalization_ack_timeout",
                 message: lateInterim
                     ? "Gemini did not acknowledge finalization; using its latest buffered transcript."
                     : "Gemini did not acknowledge finalization; using the transcript already received."
             ))
             emitComplete()
-            close()
+            closeLocked()
             return
         }
         fail(
@@ -590,7 +766,7 @@ public final class GeminiLiveTranscriber: LiveTranscriber, @unchecked Sendable {
             message: "Gemini did not finalize the transcript in time.",
             retryable: true
         )
-        close()
+        closeLocked()
     }
 
     private func closeSocketIfStillConnecting() {

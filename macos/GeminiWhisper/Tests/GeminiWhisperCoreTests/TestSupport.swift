@@ -1,82 +1,116 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import GeminiWhisperCore
 import Testing
 
+/// In-memory socket. Thread-safe: the transcriber installs callbacks from the
+/// connecting task while tests drive the socket from their own task.
 final class FakeWebSocket: GeminiWebSocket, @unchecked Sendable {
-    var readyState: GeminiWebSocketState = .connecting
-    var sent: [String] = []
-
+    private let lock = NSRecursiveLock()
+    private var state: GeminiWebSocketState = .connecting
+    private var sentMessages: [String] = []
+    private var openHandler: (() -> Void)?
+    private var messageHandler: ((String) -> Void)?
+    private var errorHandler: (() -> Void)?
+    private var closeHandler: ((Int, String) -> Void)?
     private var pendingOpen = false
     private var pendingMessages: [String] = []
     private var pendingClose: (Int, String)?
 
+    var readyState: GeminiWebSocketState {
+        get { lock.withLock { state } }
+        set { lock.withLock { state = newValue } }
+    }
+
+    var sent: [String] { lock.withLock { sentMessages } }
+
     var onOpen: (() -> Void)? {
-        didSet { flushPending() }
+        get { lock.withLock { openHandler } }
+        set { lock.withLock { openHandler = newValue }; flushPending() }
     }
 
     var onMessage: ((String) -> Void)? {
-        didSet { flushPending() }
+        get { lock.withLock { messageHandler } }
+        set { lock.withLock { messageHandler = newValue }; flushPending() }
     }
 
-    var onError: (() -> Void)?
+    var onError: (() -> Void)? {
+        get { lock.withLock { errorHandler } }
+        set { lock.withLock { errorHandler = newValue } }
+    }
 
     var onClose: ((Int, String) -> Void)? {
-        didSet { flushPending() }
+        get { lock.withLock { closeHandler } }
+        set { lock.withLock { closeHandler = newValue }; flushPending() }
     }
 
     func send(_ text: String) {
-        sent.append(text)
+        lock.withLock { sentMessages.append(text) }
     }
 
     func close(code: Int, reason: String) {
-        guard readyState != .closed else { return }
-        readyState = .closed
-        onClose?(code, reason)
+        let handler: ((Int, String) -> Void)? = lock.withLock {
+            guard state != .closed else { return nil }
+            state = .closed
+            return closeHandler
+        }
+        handler?(code, reason)
     }
 
     func simulateOpen() {
-        if onOpen != nil {
-            readyState = .open
-            onOpen?()
-        } else {
-            pendingOpen = true
+        let handler: (() -> Void)? = lock.withLock {
+            guard let openHandler else { pendingOpen = true; return nil }
+            state = .open
+            return openHandler
         }
+        handler?()
     }
 
     func simulateJSON(_ value: Any) {
         let data = try! JSONSerialization.data(withJSONObject: value)
         let text = String(data: data, encoding: .utf8)!
-        if let onMessage {
-            onMessage(text)
-        } else {
-            pendingMessages.append(text)
+        let handler: ((String) -> Void)? = lock.withLock {
+            guard let messageHandler else { pendingMessages.append(text); return nil }
+            return messageHandler
         }
+        handler?(text)
     }
 
     func remoteClose(code: Int, reason: String) {
-        readyState = .closed
-        if let onClose {
-            onClose(code, reason)
-        } else {
-            pendingClose = (code, reason)
+        let handler: ((Int, String) -> Void)? = lock.withLock {
+            state = .closed
+            guard let closeHandler else { pendingClose = (code, reason); return nil }
+            return closeHandler
         }
+        handler?(code, reason)
     }
 
     private func flushPending() {
-        if pendingOpen, let onOpen {
-            pendingOpen = false
-            readyState = .open
-            onOpen()
+        let work: (open: (() -> Void)?, messages: [String], onMessage: ((String) -> Void)?,
+                   close: (Int, String)?, onClose: ((Int, String) -> Void)?) = lock.withLock {
+            var open: (() -> Void)?
+            if pendingOpen, let openHandler {
+                pendingOpen = false
+                state = .open
+                open = openHandler
+            }
+            var messages: [String] = []
+            if messageHandler != nil, !pendingMessages.isEmpty {
+                messages = pendingMessages
+                pendingMessages = []
+            }
+            var close: (Int, String)?
+            if let pending = pendingClose, closeHandler != nil {
+                pendingClose = nil
+                close = pending
+            }
+            return (open, messages, messageHandler, close, closeHandler)
         }
-        if let onMessage, !pendingMessages.isEmpty {
-            let messages = pendingMessages
-            pendingMessages = []
-            messages.forEach { onMessage($0) }
-        }
-        if let pendingClose, let onClose {
-            self.pendingClose = nil
-            onClose(pendingClose.0, pendingClose.1)
-        }
+        work.open?()
+        if let onMessage = work.onMessage { work.messages.forEach { onMessage($0) } }
+        if let close = work.close { work.onClose?(close.0, close.1) }
     }
 }
 
@@ -211,5 +245,107 @@ final class SocketList: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return items.count
+    }
+}
+
+/// 40 ms frames of PCM16. Voiced frames are well above the speech threshold.
+func voicedPCM(ms: Int) -> Data { Data(repeating: 0x20, count: ms * PCM_BYTES_PER_MILLISECOND) }
+func silentPCM(ms: Int) -> Data { Data(count: ms * PCM_BYTES_PER_MILLISECOND) }
+
+/// Sends `pcm` in 40 ms frames, like the app's chunker does.
+func sendFrames(_ session: DictationSession, _ pcm: Data) throws {
+    var offset = 0
+    while offset < pcm.count {
+        let end = min(pcm.count, offset + PCM_CHUNK_BYTES)
+        try session.sendAudio(pcm.subdata(in: offset..<end))
+        offset = end
+    }
+}
+
+/// Live transcriber whose every reaction is scripted by the test.
+final class ScriptedTranscriber: LiveTranscriber, @unchecked Sendable {
+    let emit: (ServerEvent) -> Void
+    private let lock = NSLock()
+    private var _audioBytes = 0
+    private var _finishCalls = 0
+    private var _closed = false
+    private var _onAudio: ((ScriptedTranscriber, Data) throws -> Void)?
+    private var _onFinish: ((ScriptedTranscriber) throws -> Void)?
+    var connectEvents: [ServerEvent] = [.ready, .speechStart]
+
+    var onAudio: ((ScriptedTranscriber, Data) throws -> Void)? {
+        get { lock.withLock { _onAudio } }
+        set { lock.withLock { _onAudio = newValue } }
+    }
+    var onFinish: ((ScriptedTranscriber) throws -> Void)? {
+        get { lock.withLock { _onFinish } }
+        set { lock.withLock { _onFinish = newValue } }
+    }
+
+    init(emit: @escaping (ServerEvent) -> Void) { self.emit = emit }
+
+    var audioBytes: Int { lock.withLock { _audioBytes } }
+    var finishCalls: Int { lock.withLock { _finishCalls } }
+    var closed: Bool { lock.withLock { _closed } }
+
+    func connect() async throws { connectEvents.forEach(emit) }
+
+    func sendAudio(_ chunk: Data) throws {
+        lock.withLock { _audioBytes += chunk.count }
+        try onAudio?(self, chunk)
+    }
+
+    func finish() throws {
+        lock.withLock { _finishCalls += 1 }
+        if let onFinish { try onFinish(self) } else { emit(.complete) }
+    }
+
+    func close() { lock.withLock { _closed = true } }
+}
+
+final class TranscriberList: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [ScriptedTranscriber] = []
+    func append(_ item: ScriptedTranscriber) { lock.withLock { items.append(item) } }
+    var count: Int { lock.withLock { items.count } }
+    subscript(index: Int) -> ScriptedTranscriber { lock.withLock { items[index] } }
+}
+
+final class FakeBatchTranscriber: BatchTranscriber, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls: [RecordedAudio] = []
+    let result: @Sendable (RecordedAudio) async throws -> String
+
+    init(result: @escaping @Sendable (RecordedAudio) async throws -> String) { self.result = result }
+
+    var calls: [RecordedAudio] { lock.withLock { _calls } }
+
+    func transcribe(_ audio: RecordedAudio, hints: BatchTranscriptionHints) async throws -> BatchTranscriptionResult {
+        lock.withLock { _calls.append(audio) }
+        return BatchTranscriptionResult(text: try await result(audio), model: "fake-batch", latencyMs: 1)
+    }
+}
+
+extension EventLog {
+    func waitFor(_ typeName: String, timeout: Duration = .seconds(3)) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while clock.now < deadline {
+            if snapshot().contains(where: { $0.typeName == typeName }) { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        throw TranscriptionError("Timed out waiting for \(typeName).")
+    }
+
+    var warningCodes: [String] {
+        snapshot().compactMap { if case .warning(let code, _) = $0 { return code }; return nil }
+    }
+
+    var lastTranscript: String? {
+        snapshot().last { $0.typeName == "transcript" }.flatMap { if case .transcript(let text) = $0 { return text }; return nil }
+    }
+
+    var timing: DictationTiming? {
+        snapshot().compactMap { if case .timing(let value) = $0 { return value }; return nil }.last
     }
 }

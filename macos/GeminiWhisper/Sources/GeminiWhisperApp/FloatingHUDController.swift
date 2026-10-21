@@ -8,7 +8,11 @@ final class FloatingHUDController: NSObject {
     private var visualEffectView: NSVisualEffectView?
     private var statusDot: NSView?
     private var statusLabel: NSTextField?
+    private var levelTrack: NSView?
+    private var levelBar: NSView?
     private var scrollView: NSScrollView?
+    /// Bumped by every show/hide so a pending error auto-hide cannot hide a newer HUD.
+    private var displayToken = 0
     private var textView: NSTextView?
     private var currentText: String = ""
     private(set) var isCurrentlyActive: Bool = false
@@ -66,6 +70,17 @@ final class FloatingHUDController: NSObject {
         label.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         label.textColor = NSColor(white: 1.0, alpha: 0.65)
 
+        // Microphone level: proves the input is alive while listening.
+        let track = NSView(frame: NSRect(x: width - 76, y: height - 25, width: 60, height: 4))
+        track.wantsLayer = true
+        track.layer?.cornerRadius = 2
+        track.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.12).cgColor
+        let bar = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 4))
+        bar.wantsLayer = true
+        bar.layer?.cornerRadius = 2
+        bar.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.75).cgColor
+        track.addSubview(bar)
+
         let scroll = NSScrollView(frame: NSRect(x: 16, y: 12, width: width - 32, height: 28))
         scroll.borderType = .noBorder
         scroll.hasVerticalScroller = false
@@ -91,6 +106,7 @@ final class FloatingHUDController: NSObject {
 
         visualEffect.addSubview(dot)
         visualEffect.addSubview(label)
+        visualEffect.addSubview(track)
         visualEffect.addSubview(scroll)
 
         panel.contentView = visualEffect
@@ -98,21 +114,24 @@ final class FloatingHUDController: NSObject {
         visualEffectView = visualEffect
         statusDot = dot
         statusLabel = label
+        levelTrack = track
+        levelBar = bar
         scrollView = scroll
         textView = tv
     }
 
-    private func targetScreen() -> NSScreen {
+    /// nil only while no display is attached (for example, a closed lid with no monitor).
+    private func targetScreen() -> NSScreen? {
         let mouseLoc = NSEvent.mouseLocation
         return NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) })
             ?? NSScreen.main
-            ?? NSScreen.screens.first!
+            ?? NSScreen.screens.first
     }
 
     private func updatePositionAndSize(animated: Bool = false) {
-        guard let window, let scrollView, let statusDot, let statusLabel, let textView else { return }
+        guard let window, let scrollView, let statusDot, let statusLabel, let textView,
+              let screen = targetScreen() else { return }
 
-        let screen = targetScreen()
         let screenFrame = screen.visibleFrame
         let width = defaultWidth
         let horizontalPadding: CGFloat = 32.0
@@ -143,13 +162,15 @@ final class FloatingHUDController: NSObject {
         }
 
         statusDot.frame = NSRect(x: 16, y: totalHeight - 26, width: 8, height: 8)
-        statusLabel.frame = NSRect(x: 30, y: totalHeight - 31, width: 220, height: 18)
+        statusLabel.frame = NSRect(x: 30, y: totalHeight - 31, width: width - 120, height: 18)
+        levelTrack?.frame = NSRect(x: width - 76, y: totalHeight - 25, width: 60, height: 4)
         scrollView.frame = NSRect(x: 16, y: 12, width: availableWidth, height: textHeight)
         textView.scrollToEndOfDocument(nil)
     }
 
     func show() {
         guard let window else { return }
+        displayToken += 1
         onShow?()
         currentText = ""
         textView?.string = "Speak now…"
@@ -168,8 +189,10 @@ final class FloatingHUDController: NSObject {
 
     func hide() {
         onHide?()
+        displayToken += 1
         guard let window, isCurrentlyActive else { return }
         isCurrentlyActive = false
+        setLevel(0)
         stopPulsing()
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.2
@@ -206,6 +229,7 @@ final class FloatingHUDController: NSObject {
             statusLabel?.stringValue = "Error"
             statusDot?.layer?.backgroundColor = NSColor.systemOrange.cgColor
             stopPulsing()
+            setLevel(0)
         default:
             statusLabel?.stringValue = "Listening…"
             statusDot?.layer?.backgroundColor = NSColor(red: 1.0, green: 0.3, blue: 0.3, alpha: 1.0).cgColor
@@ -229,6 +253,38 @@ final class FloatingHUDController: NSObject {
     private func stopPulsing() {
         statusDot?.layer?.removeAnimation(forKey: "pulse")
         statusDot?.layer?.opacity = 1.0
+    }
+
+    /// Shows a failure in the HUD itself, where the user is already looking, then
+    /// hides it. Does not claim the Escape hotkey: nothing is in progress.
+    func showError(_ message: String) {
+        guard let window else { return }
+        displayToken += 1
+        let token = displayToken
+        currentText = message
+        textView?.string = message
+        textView?.textColor = NSColor(white: 1.0, alpha: 0.95)
+        setState("error")
+        updatePositionAndSize(animated: false)
+        window.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            window.animator().alphaValue = 1.0
+        }
+        isCurrentlyActive = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard self.displayToken == token else { return }
+            self.hide()
+        }
+    }
+
+    /// Input level, as frame RMS (0...1). Speech sits around 0.01-0.2, so the
+    /// meter uses a square-root scale to keep quiet speech visible.
+    func setLevel(_ rms: Double) {
+        guard let levelTrack, let levelBar else { return }
+        let scaled = min(1, max(0, (rms / 0.25).squareRoot()))
+        levelBar.frame = NSRect(x: 0, y: 0, width: levelTrack.bounds.width * scaled, height: levelTrack.bounds.height)
     }
 
     /// Status-line-only update: never touches state, dot, or transcript text.

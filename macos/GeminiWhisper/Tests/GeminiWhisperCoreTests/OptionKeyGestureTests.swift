@@ -53,3 +53,31 @@ struct OptionKeyGestureTests {
         #expect(gesture.release(at: 5).isEmpty)
     }
 }
+
+@Suite("configurable hotkey")
+struct HotkeyKeyTests {
+    @Test func distinguishesLeftAndRightModifiersByDeviceBit() {
+        // Generic Option flag (0x80000) plus the left-Option device bit only.
+        let leftOptionHeld: UInt64 = 0x0008_0000 | 0x20
+        #expect(HotkeyKey.leftOption.isDown(flags: leftOptionHeld))
+        #expect(!HotkeyKey.rightOption.isDown(flags: leftOptionHeld))
+        let bothOptions: UInt64 = 0x0008_0000 | 0x20 | 0x40
+        #expect(HotkeyKey.rightOption.isDown(flags: bothOptions))
+        #expect(HotkeyKey.rightCommand.isDown(flags: 0x0010_0000 | 0x10))
+        #expect(!HotkeyKey.rightCommand.isDown(flags: 0x0010_0000 | 0x08))
+        #expect(HotkeyKey.function.isDown(flags: 0x0080_0000))
+        #expect(HotkeyKey.rightControl.isDown(flags: 0x0004_0000 | 0x2000))
+        #expect(HotkeyKey.rightShift.isDown(flags: 0x0002_0000 | 0x04))
+    }
+
+    @Test func keyCodesMatchCarbonVirtualKeys() {
+        #expect(HotkeyKey.allCases.map(\.keyCode) == [61, 58, 54, 62, 60, 63])
+        #expect(Set(HotkeyKey.allCases.map(\.deviceFlagMask)).count == HotkeyKey.allCases.count)
+    }
+
+    @Test func unknownStoredValueFallsBackToRightOption() {
+        #expect(HotkeyKey(storedValue: nil) == .rightOption)
+        #expect(HotkeyKey(storedValue: "capsLock") == .rightOption)
+        #expect(HotkeyKey(storedValue: "function") == .function)
+    }
+}

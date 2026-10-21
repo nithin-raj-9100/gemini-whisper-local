@@ -1,18 +1,38 @@
 import Foundation
 
-/// Runtime knobs loaded from the project `.env`.
+/// Runtime knobs from the process environment and an optional `.env` file, plus
+/// the API key resolved from the environment, the Keychain, or `.env`.
 /// Never logs `GEMINI_API_KEY` or other secret values.
 struct AppEnvironment: Sendable {
+    enum KeySource: String, Sendable {
+        case environment = "process environment"
+        case keychain = "Keychain"
+        case dotEnv = ".env file"
+        case none = "not configured"
+    }
+
     var apiKey: String
+    var apiKeySource: KeySource
+    /// GEMINI_API_KEY from the process environment / `.env`, kept so the key can
+    /// be resolved again after the Keychain entry changes.
+    var processAPIKey: String
+    var dotEnvAPIKey: String
+    /// The `.env` key was copied into the Keychain at this launch.
+    var migratedToKeychain: Bool
     var language: String
     var audioDevice: String
     var stopTailMs: Int
     var intelligenceModel: String?
+    var batchModel: String?
+    /// Upper bound, in ms, on waiting for the final polish after stop.
+    var polishDeadlineMs: Int?
     /// nil when unset: patch editing defaults on and .env may force a value.
     var patchEditingOverride: Bool?
     /// nil when unset: the Settings toggle owns this unless .env forces a value.
     var optimisticPasteOverride: Bool?
     var envFileURL: URL?
+    /// `.env` was found inside the app bundle, where older builds copied it.
+    var envFileIsBundled: Bool
 
     static let defaultLanguage = "en-IN"
     static let defaultStopTailMs = 400
@@ -20,8 +40,14 @@ struct AppEnvironment: Sendable {
 
     var hasAPIKey: Bool { !apiKey.isEmpty }
 
-    static func load() -> AppEnvironment {
-        let fileURL = locateDotEnv()
+    /// Keychain items belong to the binary that created them, so only the signed
+    /// app bundle uses the Keychain; `swift run` reads the environment and `.env`.
+    static var keychainAvailable: Bool {
+        Bundle.main.bundleURL.pathExtension == "app"
+    }
+
+    static func load(keychainKey: () -> String? = { AppEnvironment.keychainAvailable ? KeychainStore.readAPIKey() : nil }) -> AppEnvironment {
+        let (fileURL, bundled) = locateDotEnv()
         let fileValues = fileURL.flatMap { parseDotEnv(at: $0) } ?? [:]
 
         func value(_ key: String, default defaultValue: String = "") -> String {
@@ -30,79 +56,79 @@ struct AppEnvironment: Sendable {
             }
             return fileValues[key] ?? defaultValue
         }
+        func optional(_ key: String) -> String? {
+            let raw = value(key)
+            return raw.isEmpty ? nil : raw
+        }
+        func flag(_ key: String) -> Bool? {
+            optional(key).map { $0 == "1" }
+        }
 
-        let stopTail = Int(value("GEMINI_WHISPER_STOP_TAIL_MS")) ?? defaultStopTailMs
-        let model = value("GEMINI_WHISPER_INTELLIGENCE_MODEL")
+        let processKey = ProcessInfo.processInfo.environment["GEMINI_API_KEY"] ?? ""
+        let fileKey = fileValues["GEMINI_API_KEY"] ?? ""
+        var storedKey = keychainKey()
+        var migrated = false
+        // First launch after the Keychain change: move a .env key into the Keychain
+        // so later launches no longer depend on a plain-text file.
+        if storedKey == nil, keychainAvailable, processKey.isEmpty, !fileKey.isEmpty,
+           (try? KeychainStore.saveAPIKey(fileKey)) != nil
+        {
+            storedKey = fileKey
+            migrated = true
+        }
+        let (apiKey, source) = resolveAPIKey(process: processKey, keychain: storedKey, dotEnv: fileKey)
 
         return AppEnvironment(
-            apiKey: value("GEMINI_API_KEY"),
+            apiKey: apiKey,
+            apiKeySource: source,
+            processAPIKey: processKey,
+            dotEnvAPIKey: fileKey,
+            migratedToKeychain: migrated,
             language: value("GEMINI_WHISPER_LANGUAGE", default: defaultLanguage),
             audioDevice: value("GEMINI_WHISPER_AUDIO_DEVICE", default: defaultAudioDevice),
-            stopTailMs: max(0, stopTail),
-            intelligenceModel: model.isEmpty ? nil : model,
-            patchEditingOverride: {
-                let raw = value("GEMINI_WHISPER_PATCH_EDITING")
-                return raw.isEmpty ? nil : raw == "1"
-            }(),
-            optimisticPasteOverride: {
-                let raw = value("GEMINI_WHISPER_OPTIMISTIC_PASTE")
-                return raw.isEmpty ? nil : raw == "1"
-            }(),
-            envFileURL: fileURL
+            stopTailMs: max(0, Int(value("GEMINI_WHISPER_STOP_TAIL_MS")) ?? defaultStopTailMs),
+            intelligenceModel: optional("GEMINI_WHISPER_INTELLIGENCE_MODEL"),
+            batchModel: optional("GEMINI_WHISPER_BATCH_MODEL"),
+            polishDeadlineMs: optional("GEMINI_WHISPER_POLISH_DEADLINE_MS").flatMap(Int.init).map { max(500, $0) },
+            patchEditingOverride: flag("GEMINI_WHISPER_PATCH_EDITING"),
+            optimisticPasteOverride: flag("GEMINI_WHISPER_OPTIMISTIC_PASTE"),
+            envFileURL: fileURL,
+            envFileIsBundled: bundled
         )
     }
 
-    /// Walk from the compiled source path, the .app bundle, and cwd until `.env` is found.
-    private static func locateDotEnv() -> URL? {
-        var candidates: [URL] = []
+    /// The process environment wins (explicit override), then the Keychain, then `.env`.
+    static func resolveAPIKey(process: String, keychain: String?, dotEnv: String) -> (String, KeySource) {
+        if !process.isEmpty { return (process, .environment) }
+        if let keychain, !keychain.isEmpty { return (keychain, .keychain) }
+        if !dotEnv.isEmpty { return (dotEnv, .dotEnv) }
+        return ("", .none)
+    }
 
-        if let resourceURL = Bundle.main.resourceURL {
-            candidates.append(resourceURL.appendingPathComponent(".env"))
-        }
-
+    /// Known `.env` locations, most specific first. Older builds copied `.env` into
+    /// the app bundle; that copy is still read so an existing install keeps working
+    /// and its key migrates to the Keychain, but new builds no longer create it.
+    private static func locateDotEnv() -> (URL?, Bool) {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        candidates.append(home.appendingPathComponent(".config/gemini-whisper/.env"))
-        candidates.append(home.appendingPathComponent(".gemini-whisper.env"))
-
-        var sourceDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        for _ in 0..<10 {
-            candidates.append(sourceDir.appendingPathComponent(".env"))
-            sourceDir.deleteLastPathComponent()
-        }
-
+        // Sources/GeminiWhisperApp/AppEnvironment.swift -> repository root.
+        var repoRoot = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { repoRoot.deleteLastPathComponent() }
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-        var dir = cwd
-        for _ in 0..<8 {
-            candidates.append(dir.appendingPathComponent(".env"))
-            dir.deleteLastPathComponent()
+        let candidates = [
+            home.appendingPathComponent(".config/gemini-whisper/.env"),
+            home.appendingPathComponent(".gemini-whisper.env"),
+            repoRoot.appendingPathComponent(".env"),
+            cwd.appendingPathComponent(".env"),
+        ]
+        for url in candidates where FileManager.default.isReadableFile(atPath: url.path) {
+            return (url.standardizedFileURL, false)
         }
-
-        if let bundleURL = Bundle.main.bundleURL as URL? {
-            var parent = bundleURL.deletingLastPathComponent()
-            for _ in 0..<6 {
-                candidates.append(parent.appendingPathComponent(".env"))
-                parent.deleteLastPathComponent()
-            }
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent(".env"),
+           FileManager.default.isReadableFile(atPath: bundled.path)
+        {
+            return (bundled.standardizedFileURL, true)
         }
-
-        if let exec = Bundle.main.executableURL {
-            var parent = exec.deletingLastPathComponent()
-            for _ in 0..<10 {
-                candidates.append(parent.appendingPathComponent(".env"))
-                parent.deleteLastPathComponent()
-            }
-        }
-
-        let seen = NSMutableSet()
-        for url in candidates {
-            let path = url.standardizedFileURL.path
-            if seen.contains(path) { continue }
-            seen.add(path)
-            if FileManager.default.isReadableFile(atPath: path) {
-                return url.standardizedFileURL
-            }
-        }
-        return nil
+        return (nil, false)
     }
 
     private static func parseDotEnv(at url: URL) -> [String: String]? {

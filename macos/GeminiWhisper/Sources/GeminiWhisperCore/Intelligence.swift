@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public let GEMINI_INTELLIGENCE_MODEL = "gemini-3.5-flash-lite"
 public let TRANSCRIPT_INTELLIGENCE_SYSTEM_INSTRUCTION = """
@@ -110,6 +113,7 @@ public struct URLSessionHTTPClient: GeminiHTTPClient {
         return (data, http)
     }
 
+    #if canImport(Darwin)
     public func stream(_ request: URLRequest) async throws -> (AsyncThrowingStream<Data, any Error>, HTTPURLResponse) {
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -129,6 +133,7 @@ public struct URLSessionHTTPClient: GeminiHTTPClient {
             continuation.onTermination = { _ in task.cancel() }
         }, http)
     }
+    #endif
 }
 
 public func createTranscriptIntelligence(
@@ -428,7 +433,7 @@ public struct GeminiSSEAccumulator {
     }
 }
 
-private func isRetryableStatus(_ status: Int) -> Bool {
+func isRetryableStatus(_ status: Int) -> Bool {
     status == 408 || status == 429 || status >= 500
 }
 
@@ -440,8 +445,9 @@ private func outputTokenCap(for input: String) -> Int {
     return min(4096, max(1024, words * 2))
 }
 
-/// Backoff between polish attempts: exponential base honoring the server's/// Retry-After hint when present, so a 429 doesn't turn into a hot retry loop.
-private func retryDelayMs(response: HTTPURLResponse?, attempt: Int) -> UInt64 {
+/// Backoff between polish attempts: exponential base honoring the server's
+/// Retry-After hint when present, so a 429 doesn't turn into a hot retry loop.
+func retryDelayMs(response: HTTPURLResponse?, attempt: Int) -> UInt64 {
     var base: UInt64 = attempt == 0 ? 750 : 1500
     if let raw = response?.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespacesAndNewlines),
        let seconds = Int(raw), seconds > 0
@@ -463,7 +469,7 @@ private func generateContentThoughtsTokens(_ payload: Any) -> Int {
     return usage["thoughtsTokenCount"] as? Int ?? 0
 }
 
-private func generateContentFinishReason(_ payload: Any) -> String? {
+func generateContentFinishReason(_ payload: Any) -> String? {
     guard let object = payload as? [String: Any],
           let candidates = object["candidates"] as? [Any],
           let first = candidates.first as? [String: Any],
@@ -474,7 +480,8 @@ private func generateContentFinishReason(_ payload: Any) -> String? {
     return reason
 }
 
-private func extractGenerateContentText(_ payload: Any) -> String {    guard let object = payload as? [String: Any],
+func extractGenerateContentText(_ payload: Any) -> String {
+    guard let object = payload as? [String: Any],
           let candidates = object["candidates"] as? [Any],
           let first = candidates.first as? [String: Any],
           let content = first["content"] as? [String: Any],

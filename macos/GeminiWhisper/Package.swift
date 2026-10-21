@@ -40,10 +40,12 @@ let package = Package(
         .executable(name: "GeminiWhisperCoreTests", targets: ["GeminiWhisperCoreTests"]),
     ],
     targets: [
+        // Swift 6 language mode: Core owns the concurrent session/transport logic,
+        // so the compiler checks its data-race safety.
         .target(
             name: "GeminiWhisperCore",
             path: "Sources/GeminiWhisperCore",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(
             name: "GeminiWhisperApp",

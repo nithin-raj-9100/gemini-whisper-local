@@ -1,4 +1,5 @@
 import Foundation
+import GeminiWhisperCore
 import Observation
 
 enum AppTranscriptionMode: String, CaseIterable, Identifiable, Sendable {
@@ -36,7 +37,10 @@ final class AppSettings {
         static let vadPrefixPaddingMs = "vadPrefixPaddingMs"
         static let vadSilenceDurationMs = "vadSilenceDurationMs"
         static let openAtLogin = "openAtLogin"
-        static let optimisticPaste = "optimisticPaste"
+        // A new key: the old "optimisticPaste" defaulted on, and its stored value
+        // cannot tell an explicit choice from that default.
+        static let optimisticPaste = "optimisticPasteRepair"
+        static let hotkey = "hotkey"
     }
 
     /// Empty string means the system default input (not an ffmpeg `:N` index).
@@ -52,7 +56,10 @@ final class AppSettings {
     var vadSilenceDurationMs: Int
     var openAtLogin: Bool
     var optimisticPaste: Bool
+    var hotkey: HotkeyKey
     var stopTailMs: Int
+    private(set) var apiKey: String
+    private(set) var apiKeySource: AppEnvironment.KeySource
     let environment: AppEnvironment
 
     var vocabularyTerms: [String] {
@@ -62,8 +69,17 @@ final class AppSettings {
             .filter { !$0.isEmpty }
     }
 
+    /// The final polish waits at most this long after stop; `.env` may lower or raise the cap.
+    var polishDeadline: PolishDeadlinePolicy {
+        guard let capMs = environment.polishDeadlineMs else { return PolishDeadlinePolicy() }
+        let cap = Double(capMs) / 1000
+        return PolishDeadlinePolicy(base: min(2.5, cap), perWord: 0.015, maximum: cap)
+    }
+
     init(environment: AppEnvironment = .load(), defaults: UserDefaults = .standard) {
         self.environment = environment
+        self.apiKey = environment.apiKey
+        self.apiKeySource = environment.apiKeySource
         self.stopTailMs = environment.stopTailMs
         self.language = defaults.string(forKey: Keys.language) ?? environment.language
         self.vocabularyText = defaults.string(forKey: Keys.vocabulary) ?? ""
@@ -97,13 +113,14 @@ final class AppSettings {
         self.openAtLogin = defaults.object(forKey: Keys.openAtLogin) != nil
             ? defaults.bool(forKey: Keys.openAtLogin)
             : false
-        // On by default: every failure path leaves the raw text in place, so the
-        // worst case is verbatim output at verbatim latency. The env var only
-        // seeds the first launch; the Settings toggle owns it afterwards.
+        // Off by default: replacing already-inserted text is only safe when the
+        // app can verify that text in place, which not every editor allows.
+        // The env var forces a value and overrides the Settings toggle.
         self.optimisticPaste = environment.optimisticPasteOverride
             ?? (defaults.object(forKey: Keys.optimisticPaste) != nil
                 ? defaults.bool(forKey: Keys.optimisticPaste)
-                : true)
+                : false)
+        self.hotkey = HotkeyKey(storedValue: defaults.string(forKey: Keys.hotkey))
     }
 
     func persist(defaults: UserDefaults = .standard) {
@@ -119,5 +136,30 @@ final class AppSettings {
         defaults.set(vadSilenceDurationMs, forKey: Keys.vadSilenceDurationMs)
         defaults.set(openAtLogin, forKey: Keys.openAtLogin)
         defaults.set(optimisticPaste, forKey: Keys.optimisticPaste)
+        defaults.set(hotkey.rawValue, forKey: Keys.hotkey)
+    }
+
+    /// Stores the key in the Keychain. A key set in the process environment still
+    /// takes precedence, as an explicit override.
+    func saveAPIKey(_ key: String) throws {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try KeychainStore.saveAPIKey(trimmed)
+        reloadAPIKey()
+    }
+
+    func removeAPIKeyFromKeychain() throws {
+        try KeychainStore.deleteAPIKey()
+        reloadAPIKey()
+    }
+
+    private func reloadAPIKey() {
+        let (key, source) = AppEnvironment.resolveAPIKey(
+            process: environment.processAPIKey,
+            keychain: AppEnvironment.keychainAvailable ? KeychainStore.readAPIKey() : nil,
+            dotEnv: environment.dotEnvAPIKey
+        )
+        apiKey = key
+        apiKeySource = source
     }
 }

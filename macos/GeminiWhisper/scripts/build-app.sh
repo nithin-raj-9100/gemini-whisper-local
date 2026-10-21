@@ -27,10 +27,9 @@ mkdir -p "$APP_OUT/Contents/Resources"
 
 cp "$PACKAGE_DIR/Resources/Info.plist" "$APP_OUT/Contents/Info.plist"
 cp "$PACKAGE_DIR/Resources/AppIcon.icns" "$APP_OUT/Contents/Resources/AppIcon.icns"
-if [[ -f "$REPO_DIR/.env" ]]; then
-  cp "$REPO_DIR/.env" "$APP_OUT/Contents/Resources/.env"
-  chmod 0600 "$APP_OUT/Contents/Resources/.env"
-fi
+# The API key is never copied into the bundle. On first launch the app moves a
+# key from the repository .env (or ~/.config/gemini-whisper/.env) into the
+# Keychain; it can also be entered in Settings.
 cp "$BIN" "$APP_OUT/Contents/MacOS/GeminiWhisper"
 chmod +x "$APP_OUT/Contents/MacOS/GeminiWhisper"
 echo -n "APPL????" > "$APP_OUT/Contents/PkgInfo"
