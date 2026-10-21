@@ -38,7 +38,13 @@ struct PcmMetrics: Sendable {
     }
 }
 
-/// Persistent `AVAudioEngine` tap converted to 16 kHz Int16 mono, from `macos/audio-helper/main.swift`.
+/// Persistent `AVAudioEngine` tap converted to 16 kHz Int16 mono.
+///
+/// Survives device changes: plugging in or removing a headset, switching the
+/// system default input, or a sample-rate change stops the engine and changes the
+/// input format. The engine's configuration-change notification and Core Audio
+/// device listeners rebuild the tap for the current device and restart capture if
+/// it was running, and the converter follows each buffer's actual format.
 final class MicrophoneCapture: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let conversionLock = NSLock()
@@ -51,8 +57,32 @@ final class MicrophoneCapture: @unchecked Sendable {
     private var onPCM: ((Data) -> Void)?
     private var diagnosticBuffer: [Data]?
     private var lastDevicePreference: String?
+    private var currentDeviceID: AudioDeviceID = 0
+    private var needsRebuild = false
+    private var configurationObserver: NSObjectProtocol?
+    private var listenersInstalled = false
 
     var isRunning: Bool { engine.isRunning }
+
+    /// Display name of the input in use, for "no signal" messages.
+    var currentDeviceName: String {
+        let id = currentDeviceID != 0 ? currentDeviceID : AudioDeviceList.defaultInputDeviceID()
+        return AudioDeviceList.name(of: id) ?? "the microphone"
+    }
+
+    init() {
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            self?.handleConfigurationChange(reason: "audio engine configuration changed")
+        }
+    }
+
+    deinit {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+        }
+    }
 
     func setPCMHandler(_ handler: @escaping (Data) -> Void) {
         lock.lock()
@@ -61,9 +91,10 @@ final class MicrophoneCapture: @unchecked Sendable {
     }
 
     func prepare() throws {
+        installDeviceListenersIfNeeded()
         guard !tapInstalled else { return }
         let input = engine.inputNode
-        let inputFormat = input.outputFormat(forBus: 0)
+        let inputFormat = input.inputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw CaptureError.noMicrophone
         }
@@ -72,22 +103,40 @@ final class MicrophoneCapture: @unchecked Sendable {
             sampleRate: 16_000,
             channels: 1,
             interleaved: true
-        ), let converter = AVAudioConverter(from: inputFormat, to: format) else {
+        ) else {
             throw CaptureError.converterFailed
         }
-        self.outputFormat = format
-        self.converter = converter
-        installTapIfNeeded(input: input, inputFormat: inputFormat)
+        conversionLock.withLock {
+            outputFormat = format
+            converter = nil
+        }
+        tapInstalled = true
+        reportedConversionError = false
+        // nil format: the tap uses the bus's current format. Passing a cached
+        // format that no longer matches the hardware raises an exception.
+        input.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self] buffer, _ in
+            self?.convert(buffer: buffer)
+        }
         engine.prepare()
     }
 
     func start() throws {
+        if needsRebuild {
+            rebuild(reason: "pending device change")
+        }
         if !tapInstalled {
             try prepare()
         }
         guard !engine.isRunning else { return }
         conversionLock.withLock { acceptingAudio = true }
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // A stale graph after a device change fails to start; rebuild once.
+            rebuild(reason: "engine start failed: \(error.localizedDescription)")
+            try prepare()
+            try engine.start()
+        }
     }
 
     func pause() {
@@ -106,6 +155,11 @@ final class MicrophoneCapture: @unchecked Sendable {
         if engine.isRunning {
             engine.stop()
         }
+    }
+
+    /// Mark the graph stale, for example after sleep. The next start rebuilds it.
+    func markNeedsRebuild() {
+        needsRebuild = true
     }
 
     /// Capture ~1s of PCM and return RMS/peak, matching `POST /audio-check`.
@@ -133,7 +187,7 @@ final class MicrophoneCapture: @unchecked Sendable {
         var metrics = PcmMetrics()
         metrics.add(combined)
         return AudioCheckResult(
-            source: "AVAudioEngine default input",
+            source: currentDeviceName,
             bytes: metrics.bytes,
             rms: metrics.rms,
             peak: metrics.peak,
@@ -162,30 +216,91 @@ final class MicrophoneCapture: @unchecked Sendable {
     }
 
     /// Select an input by `AVCaptureDevice.uniqueID`. Empty / `:0` / `default` uses the system default.
-    /// No-op when the preference is unchanged: reinstalling the tap and
+    /// No-op when the resolved device is unchanged: reinstalling the tap and
     /// re-priming the converter every toggle risks dropping leading frames.
+    /// A preferred device that is no longer connected falls back to the default.
     func applyPreferredDevice(uniqueID: String) {
         let normalized = AudioDeviceList.normalizedPreference(uniqueID)
-        lock.lock()
-        let unchanged = normalized == lastDevicePreference
-        lock.unlock()
-        if unchanged, tapInstalled { return }
-        lock.lock()
-        lastDevicePreference = normalized
-        lock.unlock()
-        resetTap()
-        if AudioDeviceList.isSystemDefaultPreference(uniqueID) {
-            let defaultID = AudioDeviceList.defaultInputDeviceID()
-            if defaultID != 0 {
-                setInputDevice(defaultID)
-            }
+        let resolved = resolveDevice(preference: normalized)
+        if tapInstalled, !needsRebuild, normalized == lastDevicePreference, resolved == currentDeviceID {
             return
         }
+        lastDevicePreference = normalized
+        rebuild(reason: "input device \(AudioDeviceList.name(of: resolved) ?? "default")", deviceID: resolved)
+    }
+
+    private func resolveDevice(preference: String) -> AudioDeviceID {
+        if preference.isEmpty {
+            return AudioDeviceList.defaultInputDeviceID()
+        }
         let devices = AudioDeviceList.inputDevices()
-        let match = devices.first(where: { $0.uniqueID == uniqueID })
-            ?? devices.first(where: { $0.name == uniqueID })
-        guard let match, match.audioDeviceID != 0 else { return }
-        setInputDevice(match.audioDeviceID)
+        if let match = devices.first(where: { $0.uniqueID == preference }) ?? devices.first(where: { $0.name == preference }),
+           match.audioDeviceID != 0
+        {
+            return match.audioDeviceID
+        }
+        AppLog.line("Preferred input \(preference) is not connected; using the system default.")
+        return AudioDeviceList.defaultInputDeviceID()
+    }
+
+    /// Tear down the tap and converter and rebuild the graph for `deviceID`,
+    /// restarting capture when it was running.
+    private func rebuild(reason: String, deviceID: AudioDeviceID? = nil) {
+        let wasCapturing = conversionLock.withLock { acceptingAudio }
+        if engine.isRunning { engine.stop() }
+        resetTap()
+        engine.reset()
+        let target = deviceID ?? resolveDevice(preference: lastDevicePreference ?? AudioDeviceList.systemDefaultPreference)
+        if target != 0 {
+            setInputDevice(target)
+        }
+        currentDeviceID = target
+        needsRebuild = false
+        AppLog.line("Audio input rebuilt (\(reason)); device=\(AudioDeviceList.name(of: target) ?? "unknown") capturing=\(wasCapturing)")
+        guard wasCapturing else { return }
+        do {
+            try prepare()
+            try engine.start()
+        } catch {
+            AppLog.line("Audio input restart failed after rebuild: \(error.localizedDescription)")
+        }
+    }
+
+    private func handleConfigurationChange(reason: String) {
+        let capturing = conversionLock.withLock { acceptingAudio }
+        if capturing {
+            rebuild(reason: reason)
+        } else {
+            needsRebuild = true
+            AppLog.line("Audio input marked for rebuild (\(reason)).")
+        }
+    }
+
+    /// Core Audio listeners for the system default input and the device list.
+    private func installDeviceListenersIfNeeded() {
+        guard !listenersInstalled else { return }
+        listenersInstalled = true
+        var defaultAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        _ = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &defaultAddress, DispatchQueue.main) { [weak self] _, _ in
+            guard let self, (self.lastDevicePreference ?? "").isEmpty else { return }
+            self.handleConfigurationChange(reason: "system default input changed")
+        }
+        var devicesAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        _ = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devicesAddress, DispatchQueue.main) { [weak self] _, _ in
+            guard let self else { return }
+            let preference = self.lastDevicePreference ?? ""
+            if self.resolveDevice(preference: preference) != self.currentDeviceID {
+                self.handleConfigurationChange(reason: "input devices changed")
+            }
+        }
     }
 
     private func resetTap() {
@@ -193,8 +308,9 @@ final class MicrophoneCapture: @unchecked Sendable {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
-        converter = nil
-        outputFormat = nil
+        conversionLock.withLock {
+            converter = nil
+        }
         reportedConversionError = false
     }
 
@@ -211,21 +327,17 @@ final class MicrophoneCapture: @unchecked Sendable {
         )
     }
 
-    private func installTapIfNeeded(input: AVAudioInputNode, inputFormat: AVAudioFormat) {
-        guard !tapInstalled else { return }
-        tapInstalled = true
-        reportedConversionError = false
-        input.installTap(onBus: 0, bufferSize: 1_024, format: inputFormat) { [weak self] buffer, _ in
-            self?.convert(buffer: buffer, inputFormat: inputFormat)
-        }
-    }
-
-    private func convert(buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat) {
+    private func convert(buffer: AVAudioPCMBuffer) {
         conversionLock.lock()
         defer { conversionLock.unlock() }
-        guard acceptingAudio else { return }
-        guard let outputFormat, let converter else { return }
-        let estimatedFrames = ceil(Double(buffer.frameLength) * 16_000 / inputFormat.sampleRate) + 8
+        guard acceptingAudio, let outputFormat else { return }
+        // The input format can change under a running tap (device switch, sample
+        // rate change). Follow the buffer, never a cached format.
+        if converter == nil || converter?.inputFormat != buffer.format {
+            converter = AVAudioConverter(from: buffer.format, to: outputFormat)
+        }
+        guard let converter else { return }
+        let estimatedFrames = ceil(Double(buffer.frameLength) * 16_000 / buffer.format.sampleRate) + 8
         guard let converted = AVAudioPCMBuffer(
             pcmFormat: outputFormat,
             frameCapacity: AVAudioFrameCount(estimatedFrames)
@@ -349,6 +461,21 @@ enum AudioDeviceList {
             )
         }
         return result
+    }
+
+    /// Core Audio display name of a device.
+    static func name(of deviceID: AudioDeviceID) -> String? {
+        guard deviceID != 0 else { return nil }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var name: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name)
+        guard status == noErr, let name else { return nil }
+        return name.takeRetainedValue() as String
     }
 
     static func defaultInputDeviceID() -> AudioDeviceID {

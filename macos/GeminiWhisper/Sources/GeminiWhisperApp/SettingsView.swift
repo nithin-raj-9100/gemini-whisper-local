@@ -1,4 +1,5 @@
 import AVFoundation
+import GeminiWhisperCore
 import SwiftUI
 
 struct SettingsView: View {
@@ -8,9 +9,63 @@ struct SettingsView: View {
 
     @State private var devices: [AudioDeviceList.Device] = []
     @State private var loginItemError = ""
+    @State private var newAPIKey = ""
+    @State private var apiKeyMessage = ""
 
     var body: some View {
         Form {
+            Section("Gemini API key") {
+                LabeledContent("Status") {
+                    Text(settings.apiKey.isEmpty ? "not configured" : "loaded from \(settings.apiKeySource.rawValue)")
+                }
+                if AppEnvironment.keychainAvailable {
+                    SecureField("Paste a new API key", text: $newAPIKey)
+                    HStack {
+                        Button("Save to Keychain") {
+                            do {
+                                try settings.saveAPIKey(newAPIKey)
+                                newAPIKey = ""
+                                apiKeyMessage = "Saved to the Keychain."
+                            } catch {
+                                apiKeyMessage = error.localizedDescription
+                            }
+                        }
+                        .disabled(newAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Button("Remove from Keychain") {
+                            do {
+                                try settings.removeAPIKeyFromKeychain()
+                                apiKeyMessage = "Removed from the Keychain."
+                            } catch {
+                                apiKeyMessage = error.localizedDescription
+                            }
+                        }
+                        .disabled(settings.apiKeySource != .keychain)
+                    }
+                    Text("The key is stored in your login Keychain and never written to the app bundle. GEMINI_API_KEY in the process environment overrides it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Running outside the app bundle: set GEMINI_API_KEY in the environment or .env.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !apiKeyMessage.isEmpty {
+                    Text(apiKeyMessage)
+                        .font(.caption)
+                }
+            }
+
+            Section("Hotkey") {
+                Picker("Dictation key", selection: Bindable(settings).hotkey) {
+                    ForEach(HotkeyKey.allCases) { key in
+                        Text(key.title).tag(key)
+                    }
+                }
+                Text("Tap to start and stop, or hold while speaking. Pick a key you never use for typing: Right Option types special characters on many layouts. For Fn/Globe, set System Settings → Keyboard → “Press 🌐 key to” → Do Nothing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Transcription") {
                 TextField("Language (BCP-47)", text: Bindable(settings).language)
                 TextField("Vocabulary (comma-separated)", text: Bindable(settings).vocabularyText, axis: .vertical)
@@ -24,7 +79,7 @@ struct SettingsView: View {
                     .disabled(settings.mode == .verbatim)
                 Toggle("Insert immediately, polish in place", isOn: Bindable(settings).optimisticPaste)
                     .disabled(settings.mode == .verbatim || !settings.polish)
-                Text("Pastes the raw transcript the moment it settles, then reselects and replaces it once polish lands, so text appears at verbatim speed with polished output. The replacement is skipped if you type or click first, leaving the raw text. Turn off if you dictate into editors that auto-indent or auto-complete while you wait.")
+                Text("Off by default. Pastes the raw transcript the moment it settles, then replaces it once polish lands. The replacement only happens when Accessibility confirms the inserted text is still right before the cursor; otherwise, or if you type or click first, the raw text stays. Editors that auto-format, terminals, and many web apps keep the raw text.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker("VAD", selection: Bindable(settings).vad) {
@@ -54,9 +109,6 @@ struct SettingsView: View {
                     Text(settings.environment.envFileURL?.path ?? "not found")
                         .lineLimit(2)
                         .truncationMode(.middle)
-                }
-                LabeledContent("API key") {
-                    Text(settings.environment.hasAPIKey ? "loaded" : "missing")
                 }
                 Button("Audio check (1s RMS / peak)") {
                     Task { await controller.runAudioCheck() }
@@ -107,7 +159,7 @@ struct SettingsView: View {
                         .lineLimit(3)
                         .textSelection(.enabled)
                 }
-                LabeledContent("Paste log") {
+                LabeledContent("Log") {
                     Text(AppLog.fileURL.path)
                         .lineLimit(2)
                         .textSelection(.enabled)
@@ -147,6 +199,34 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                 }
             }
+
+            Section("Recent transcripts (this session only)") {
+                if controller.history.entries.isEmpty {
+                    Text("Nothing yet. Transcripts are kept in memory until the app quits.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(controller.history.entries) { entry in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(entry.date.formatted(date: .omitted, time: .standard))
+                            Text(entry.outcome.rawValue)
+                                .foregroundStyle(entry.outcome == .inserted ? Color.secondary : Color.orange)
+                            if let target = entry.targetName {
+                                Text(target).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Copy") { controller.copyHistoryEntry(entry.id) }
+                                .disabled(entry.text.isEmpty)
+                        }
+                        .font(.caption)
+                        if !entry.text.isEmpty {
+                            Text(entry.text)
+                                .lineLimit(3)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .frame(minWidth: 480, minHeight: 520)
@@ -165,11 +245,25 @@ struct SettingsView: View {
         }
         .onChange(of: settings.language) { _, _ in settings.persist() }
         .onChange(of: settings.vocabularyText) { _, _ in settings.persist() }
-        .onChange(of: settings.mode) { _, _ in settings.persist() }
-        .onChange(of: settings.polish) { _, _ in settings.persist() }
+        .onChange(of: settings.mode) { _, _ in
+            settings.persist()
+            controller.applySettings()
+        }
+        .onChange(of: settings.polish) { _, _ in
+            settings.persist()
+            controller.applySettings()
+        }
         .onChange(of: settings.vad) { _, _ in settings.persist() }
         .onChange(of: settings.vadPrefixPaddingMs) { _, _ in settings.persist() }
         .onChange(of: settings.vadSilenceDurationMs) { _, _ in settings.persist() }
+        .onChange(of: settings.optimisticPaste) { _, _ in
+            settings.persist()
+            controller.applySettings()
+        }
+        .onChange(of: settings.hotkey) { _, _ in
+            settings.persist()
+            controller.applySettings()
+        }
         .onChange(of: settings.audioDevice) { _, _ in
             settings.persist()
             controller.prepareCapture()

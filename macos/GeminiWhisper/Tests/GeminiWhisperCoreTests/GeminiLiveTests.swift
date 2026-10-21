@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import GeminiWhisperCore
 import Testing
 
@@ -156,6 +159,8 @@ struct GeminiLiveTests {
         async let connected: Void = transcriber.connect()
         await Task.yield()
         socket.simulateOpen()
+        // connect() may still be installing callbacks; the open is delivered then.
+        for _ in 0..<500 where socket.sent.isEmpty { try await Task.sleep(for: .milliseconds(1)) }
         #expect(jsonEquals(jsonObject(socket.sent[0]), buildGeminiSetup(.default)))
         socket.simulateJSON(["setupComplete": [String: Any]()])
         try await connected

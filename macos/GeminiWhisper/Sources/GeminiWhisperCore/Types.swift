@@ -96,6 +96,12 @@ public enum ServerEvent: Sendable, Equatable {
     /// Partial polished text while the final call streams. Preview only.
     case polishProgress(text: String)
     case warning(code: String, message: String)
+    /// Authoritative raw transcript after every change: interim, final, Live
+    /// rotation, or batch recovery. Consumers display and insert this text instead
+    /// of re-merging interim/final events themselves.
+    case transcript(text: String)
+    /// Gemini announced that it will close the Live connection soon.
+    case goAway(timeLeftMs: Int)
     case timing(DictationTiming)
     case complete
     case cancelled
@@ -116,6 +122,8 @@ public enum ServerEvent: Sendable, Equatable {
         case .provisional: return "provisional"
         case .polishProgress: return "polish-progress"
         case .warning: return "warning"
+        case .transcript: return "transcript"
+        case .goAway: return "go-away"
         case .timing: return "timing"
         case .complete: return "complete"
         case .cancelled: return "cancelled"
@@ -214,9 +222,15 @@ public enum JSONValue: Sendable, Equatable {
         case is NSNull:
             return .null
         case let number as NSNumber:
+            #if canImport(Darwin)
             if CFGetTypeID(number) == CFBooleanGetTypeID() {
                 return .bool(number.boolValue)
             }
+            #else
+            if String(cString: number.objCType) == "c" {
+                return .bool(number.boolValue)
+            }
+            #endif
             let double = number.doubleValue
             if double.rounded() == double, double >= Double(Int.min), double <= Double(Int.max) {
                 return .int(number.intValue)
@@ -286,4 +300,13 @@ public struct DictationTiming: Sendable, Equatable {
     public let backgroundJobs: Int
     public let finalJobs: Int
     public let liveFallback: Bool
+    /// Captured audio and the part of it that carried speech energy.
+    public var audioMs: Int = 0
+    public var voicedMs: Int = 0
+    /// Where the raw transcript came from: "live", "batch", or "none".
+    public var transcriptSource: String = "live"
+    /// Why batch recovery ran (empty when it did not).
+    public var batchReason: String = ""
+    public var liveReconnects: Int = 0
+    public var liveRotations: Int = 0
 }

@@ -7,9 +7,11 @@ import GeminiWhisperCore
 
 nonisolated(unsafe) private var hotkeyEventTapPort: CFMachPort?
 
-/// Right Option tap toggles; holding for 0.6s records until release. Escape cancels.
-/// Left Option is intentionally ignored.
-/// Mirrors `macos/audio-helper/main.swift`: Carbon hotkey + NSEvent monitors + CGEventTap.
+/// The configured hotkey (Right Option by default): a tap toggles; holding for
+/// 0.6s records until release. Escape cancels. Using the key as a modifier
+/// cancels that gesture.
+/// Carbon hotkey + NSEvent monitors + CGEventTap. The event tap retries until
+/// Accessibility is granted and is re-validated after sleep.
 final class HotkeyMonitor: @unchecked Sendable {
     static let shared = HotkeyMonitor()
 
@@ -20,17 +22,27 @@ final class HotkeyMonitor: @unchecked Sendable {
     var onHoldCancel: (() -> Void)?
     var onToggle: (() -> Void)?
     var onCancel: (() -> Void)?
+    /// Called on the main thread when the event tap is (re)installed.
+    var onEventTapChanged: (() -> Void)?
     private(set) var eventTapInstalled = false
     private(set) var eventTapFailureMessage: String?
 
-    private let kVKRightOption: UInt16 = 61
+    /// Changing the key abandons any gesture in progress on the old one.
+    var hotkey: HotkeyKey = .rightOption {
+        didSet {
+            guard hotkey != oldValue else { return }
+            interruptGesture()
+            gesture = OptionKeyGesture()
+            hotkeyPressTime = 0
+        }
+    }
+
     private let kVKEscape: UInt16 = 53
 
-    private var lastToggleTriggerTime: UInt64 = 0
-    private var optionPressTime: UInt64 = 0
-    /// Down-stroke time of the last completed tap (mach_absolute_time).
-    /// Lets the stop-to-paste metric also report press-down → paste (felt latency).
-    private(set) var lastTapDownTime: UInt64 = 0
+    private var lastToggleTriggerTime: TimeInterval = 0
+    private var hotkeyPressTime: TimeInterval = 0
+    /// Key-down uptime of the last completed tap or hold, for felt latency.
+    private(set) var lastTapDownUptime: TimeInterval = 0
     private var gesture = OptionKeyGesture()
     private var holdTask: Task<Void, Never>?
     private var escapeHotKeyRef: EventHotKeyRef?
@@ -39,6 +51,8 @@ final class HotkeyMonitor: @unchecked Sendable {
         get { hotkeyEventTapPort }
         set { hotkeyEventTapPort = newValue }
     }
+    private var eventTapSource: CFRunLoopSource?
+    private var retryTimer: Timer?
     private var carbonHandlerInstalled = false
     private var monitorsInstalled = false
     private var localKeyMonitor: Any?
@@ -56,7 +70,9 @@ final class HotkeyMonitor: @unchecked Sendable {
     func stop() {
         interruptGesture()
         gesture = OptionKeyGesture()
-        optionPressTime = 0
+        hotkeyPressTime = 0
+        retryTimer?.invalidate()
+        retryTimer = nil
         unregisterEscapeHotKey()
         if let tap = globalEventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -94,8 +110,8 @@ final class HotkeyMonitor: @unchecked Sendable {
     }
 
     fileprivate func triggerDictationToggle() {
-        let now = mach_absolute_time()
-        if lastToggleTriggerTime > 0 && timeIntervalSinceAbsoluteTime(lastToggleTriggerTime) < 0.35 {
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastToggleTriggerTime > 0 && now - lastToggleTriggerTime < 0.35 {
             return
         }
         lastToggleTriggerTime = now
@@ -108,12 +124,15 @@ final class HotkeyMonitor: @unchecked Sendable {
         onCancel?()
     }
 
-    fileprivate func handleModifierChange(keyCode: UInt16, isOptionDown: Bool) {
-        if keyCode == kVKRightOption {
-            if isOptionDown {
-                let actions = gesture.press(at: ProcessInfo.processInfo.systemUptime)
+    /// `flags` are the raw modifier flags; the configured key's device bit tells
+    /// whether it is down, independent of the matching key on the other side.
+    fileprivate func handleModifierChange(keyCode: UInt16, flags: UInt64) {
+        if keyCode == hotkey.keyCode {
+            if hotkey.isDown(flags: flags) {
+                let now = ProcessInfo.processInfo.systemUptime
+                let actions = gesture.press(at: now)
                 guard !actions.isEmpty else { return } // duplicate event-tap/NSEvent delivery
-                optionPressTime = mach_absolute_time()
+                hotkeyPressTime = now
                 holdTask = Task { @MainActor [weak self] in
                     do { try await Task.sleep(for: .milliseconds(600)) } catch { return }
                     guard let self, !Task.isCancelled else { return }
@@ -126,9 +145,9 @@ final class HotkeyMonitor: @unchecked Sendable {
                 holdTask = nil
                 perform(gesture.release(at: ProcessInfo.processInfo.systemUptime))
                 onDiscardPreparation?()
-                optionPressTime = 0
+                hotkeyPressTime = 0
             }
-        } else if optionPressTime > 0 {
+        } else if hotkeyPressTime > 0 {
             interruptGesture()
         }
     }
@@ -138,10 +157,10 @@ final class HotkeyMonitor: @unchecked Sendable {
             switch action {
             case .prepare: onPrepare?()
             case .toggle:
-                lastTapDownTime = optionPressTime
+                lastTapDownUptime = hotkeyPressTime
                 triggerDictationToggle()
             case .startHold:
-                lastTapDownTime = optionPressTime
+                lastTapDownUptime = hotkeyPressTime
                 onHoldStart?()
             case .finishHold: onHoldEnd?()
             case .discardPreparation: onDiscardPreparation?()
@@ -159,7 +178,7 @@ final class HotkeyMonitor: @unchecked Sendable {
     fileprivate func noteKeyDown(keyCode: UInt16) {
         if keyCode == kVKEscape {
             handleEscapeKey()
-        } else if optionPressTime > 0 {
+        } else if hotkeyPressTime > 0 {
             interruptGesture()
         }
     }
@@ -174,10 +193,10 @@ final class HotkeyMonitor: @unchecked Sendable {
         monitorsInstalled = true
 
         globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            let isOptionDown = event.modifierFlags.contains(.option)
+            let flags = UInt64(event.modifierFlags.rawValue)
             let keyCode = event.keyCode
             DispatchQueue.main.async {
-                self?.handleModifierChange(keyCode: keyCode, isOptionDown: isOptionDown)
+                self?.handleModifierChange(keyCode: keyCode, flags: flags)
             }
         }
 
@@ -238,23 +257,57 @@ final class HotkeyMonitor: @unchecked Sendable {
             callback: hotkeyEventTapCallback,
             userInfo: nil
         ) else {
+            if eventTapFailureMessage == nil {
+                FileHandle.standardError.write(Data("CGEvent.tapCreate failed. Accessibility is required for the dictation hotkey.\n".utf8))
+            }
             eventTapInstalled = false
             eventTapFailureMessage =
-                "Could not create the keyboard event tap. Grant Accessibility to Gemini Whisper in System Settings → Privacy & Security → Accessibility, then restart the app or retry below."
-            FileHandle.standardError.write(Data("CGEvent.tapCreate failed. Accessibility is required for Right Option.\n".utf8))
+                "Could not create the keyboard event tap. Grant Accessibility to Gemini Whisper in System Settings → Privacy & Security → Accessibility; the app retries automatically."
+            scheduleRetry()
             return
         }
         globalEventTap = eventTap
         eventTapInstalled = true
         eventTapFailureMessage = nil
+        retryTimer?.invalidate()
+        retryTimer = nil
         let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .defaultMode)
+        eventTapSource = runLoopSource
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
+        onEventTapChanged?()
+    }
+
+    /// Accessibility is often granted after launch; pick it up without a restart.
+    private func scheduleRetry() {
+        guard retryTimer == nil else { return }
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.installEventTap()
+        }
     }
 
     func retryEventTap() {
         installEventTap()
+    }
+
+    /// After sleep or a permission change the tap can be disabled or invalidated
+    /// while the app keeps running; re-enable or rebuild it.
+    func revalidate() {
+        guard let tap = globalEventTap else {
+            installEventTap()
+            return
+        }
+        if !CFMachPortIsValid(tap) {
+            if let eventTapSource {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
+            }
+            eventTapSource = nil
+            globalEventTap = nil
+            eventTapInstalled = false
+            installEventTap()
+        } else if !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
     }
 }
 
@@ -272,9 +325,9 @@ private let hotkeyEventTapCallback: CGEventTapCallBack = { _, type, event, _ in
             HotkeyMonitor.shared.noteKeyDown(keyCode: keyCode)
         }
     } else if type == .flagsChanged {
-        let isOptionDown = event.flags.contains(.maskAlternate)
+        let flags = event.flags.rawValue
         DispatchQueue.main.async {
-            HotkeyMonitor.shared.handleModifierChange(keyCode: keyCode, isOptionDown: isOptionDown)
+            HotkeyMonitor.shared.handleModifierChange(keyCode: keyCode, flags: flags)
         }
     }
     return Unmanaged.passUnretained(event)

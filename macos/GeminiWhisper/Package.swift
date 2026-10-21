@@ -3,12 +3,28 @@
 import Foundation
 import PackageDescription
 
+/// Testing.framework from the toolchain that compiles the tests. Its macros come
+/// from that toolchain; a framework from another install (Command Line Tools
+/// next to a newer Xcode) has a different macro ABI and the tests do not build.
 let testingFrameworkPath: String? = {
-    let candidates = [
-        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
-        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
-        "/Applications/Xcode.app/Contents/Developer/Library/Frameworks",
+    var developerDirectories: [String] = []
+    if let explicit = ProcessInfo.processInfo.environment["DEVELOPER_DIR"], !explicit.isEmpty {
+        developerDirectories.append(explicit)
+    }
+    if let selected = try? FileManager.default.destinationOfSymbolicLink(atPath: "/var/db/xcode_select_link") {
+        developerDirectories.append(selected)
+    }
+    developerDirectories += [
+        "/Library/Developer/CommandLineTools",
+        "/Applications/Xcode.app/Contents/Developer",
     ]
+    let candidates = developerDirectories.flatMap { directory in
+        [
+            directory + "/Library/Developer/Frameworks",
+            directory + "/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+            directory + "/Library/Frameworks",
+        ]
+    }
     return candidates.first {
         FileManager.default.fileExists(atPath: $0 + "/Testing.framework")
     }
@@ -40,10 +56,12 @@ let package = Package(
         .executable(name: "GeminiWhisperCoreTests", targets: ["GeminiWhisperCoreTests"]),
     ],
     targets: [
+        // Swift 6 language mode: Core owns the concurrent session/transport logic,
+        // so the compiler checks its data-race safety.
         .target(
             name: "GeminiWhisperCore",
             path: "Sources/GeminiWhisperCore",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(
             name: "GeminiWhisperApp",

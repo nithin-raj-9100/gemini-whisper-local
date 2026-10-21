@@ -11,7 +11,7 @@ public final class PCMDeliveryStream: @unchecked Sendable {
     private let lock = NSLock()
     private let queue: DispatchQueue
     private var pending: [Block] = []
-    private var handler: ((Block) -> Void)?
+    private var handler: (@Sendable (Block) -> Void)?
     private var sealed = false
     private var sequence = 0
     private var samples = 0
@@ -29,7 +29,7 @@ public final class PCMDeliveryStream: @unchecked Sendable {
         }
     }
 
-    public func commit(_ handler: @escaping (Block) -> Void) {
+    public func commit(_ handler: @escaping @Sendable (Block) -> Void) {
         lock.withLock {
             guard !sealed, self.handler == nil else { return }
             self.handler = handler

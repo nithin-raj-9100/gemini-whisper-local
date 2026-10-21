@@ -51,3 +51,42 @@ struct ClipboardTests {
         #expect(pasteboard.pasteboardItems?.isEmpty ?? true)
     }
 }
+
+@Suite("clipboard guard")
+@MainActor
+struct ClipboardGuardTests {
+    init() {
+        _ = NSApplication.shared
+    }
+
+    @Test func transcriptIsMarkedTransientForClipboardManagers() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        ClipboardSnapshot.replaceString("dictated text", on: pasteboard)
+        let types = pasteboard.pasteboardItems?.first?.types ?? []
+        #expect(types.contains(NSPasteboard.PasteboardType("org.nspasteboard.TransientType")))
+        #expect(pasteboard.string(forType: .string) == "dictated text")
+    }
+
+    @Test func restoreNeverClobbersSomethingCopiedAfterThePaste() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        pasteboard.setString("prior clipboard", forType: .string)
+        let snapshot = ClipboardSnapshot.replaceString("dictated text", on: pasteboard)
+        let ours = pasteboard.changeCount
+
+        // The user copies something new before the delayed restore runs.
+        pasteboard.clearContents()
+        pasteboard.setString("copied by the user", forType: .string)
+        #expect(!snapshot.restore(to: pasteboard, ifChangeCount: ours))
+        #expect(pasteboard.string(forType: .string) == "copied by the user")
+    }
+
+    @Test func restoreRunsWhileTheTranscriptIsStillThere() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        pasteboard.setString("prior clipboard", forType: .string)
+        let snapshot = ClipboardSnapshot.replaceString("dictated text", on: pasteboard)
+        #expect(snapshot.restore(to: pasteboard, ifChangeCount: pasteboard.changeCount))
+        #expect(pasteboard.string(forType: .string) == "prior clipboard")
+    }
+}
