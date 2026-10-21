@@ -139,17 +139,14 @@ struct TransportResilienceTests {
         let deadline = Date().addingTimeInterval(1.4)
         // A dedicated thread, like URLSession's delegate queue: a busy loop on the
         // cooperative pool would starve unrelated tests.
-        let finished = DispatchSemaphore(value: 0)
         let thread = Thread {
             while Date() < deadline {
                 socket.simulateJSON(["serverContent": ["interimInputTranscription": ["text": "late words"]]])
                 Thread.sleep(forTimeInterval: 0.001)
             }
-            finished.signal()
         }
         thread.start()
-        try await Task.sleep(for: .milliseconds(1_600))
-        _ = finished.wait(timeout: .now() + 2)
+        try await Task.sleep(for: .milliseconds(1_700))
         #expect(log.snapshot().filter { $0.typeName == "complete" }.count == 1)
     }
 }
