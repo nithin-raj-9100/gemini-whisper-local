@@ -67,13 +67,14 @@ struct TransportResilienceTests {
         let log = EventLog()
         let transcriber = try await connectedTranscriber(sockets: sockets, log: log)
         sockets[0].remoteClose(code: 1006, reason: "network")
-        try await Task.sleep(for: .milliseconds(260))
+        try await Task.sleep(for: .milliseconds(350))
         #expect(sockets.count == 2)
-        // The second attempt fails before setup completes, so the next delay doubles.
+        // The second attempt fails before setup completes, so the next delay
+        // doubles to 400 ms: nothing at 250 ms, a third socket by 700 ms.
         sockets[1].remoteClose(code: 1006, reason: "network")
-        try await Task.sleep(for: .milliseconds(260))
+        try await Task.sleep(for: .milliseconds(250))
         #expect(sockets.count == 2)
-        try await Task.sleep(for: .milliseconds(300))
+        try await Task.sleep(for: .milliseconds(450))
         #expect(sockets.count == 3)
         transcriber.close()
     }
@@ -88,7 +89,7 @@ struct TransportResilienceTests {
         try await Task.sleep(for: .milliseconds(700))
         #expect(sockets.count == 1)
         network.isSatisfied = true
-        try await Task.sleep(for: .milliseconds(400))
+        try await Task.sleep(for: .milliseconds(600))
         #expect(sockets.count == 2)
         transcriber.close()
     }

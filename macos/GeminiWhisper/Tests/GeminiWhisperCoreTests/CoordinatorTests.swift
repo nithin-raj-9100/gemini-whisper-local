@@ -213,9 +213,14 @@ struct CoordinatorTests {
                 }
             }
         }
-        try await harness.dictate(voicedPCM(ms: 600))
+        harness.coordinator.toggle()
+        try await harness.waitUntil { harness.transcribers.count > 0 }
+        harness.capture.speak(voicedPCM(ms: 600))
+        // The status is shown while listening; stop only once it has arrived.
+        try await harness.waitUntil { harness.feedback.statuses.contains { $0.contains("still recording") } }
+        harness.coordinator.toggle()
+        try await harness.waitUntil { harness.coordinator.phase == .idle }
         #expect(harness.inserter.inserted == ["Every word, recovered from audio."])
-        #expect(harness.feedback.statuses.contains { $0.contains("still recording") })
         #expect(harness.feedback.statuses.contains("Recovering transcript from audio…"))
         let outcome = try #require(harness.logs.outcome("inserted"))
         #expect(outcome.contains("source=batch") && outcome.contains("batch=live_failed"))
@@ -381,8 +386,7 @@ struct CoordinatorTests {
         harness.capture.speak(voicedPCM(ms: 80))
         harness.coordinator.toggle()
         #expect(harness.transcribers.count == 2)
-        try await Task.sleep(for: .milliseconds(30))
-        #expect(harness.transcribers[1].audioBytes == 80 * PCM_BYTES_PER_MILLISECOND)
+        try await harness.waitUntil { harness.transcribers[1].audioBytes == 80 * PCM_BYTES_PER_MILLISECOND }
         harness.coordinator.cancel()
     }
 
