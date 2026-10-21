@@ -2,23 +2,27 @@
 
 A native macOS menu-bar app for Wispr Flow-style realtime dictation using Gemini 3.5 Transcribe Live.
 Tap **Right Option** to start, speak, tap **Right Option** again to stop. Or hold
-**Right Option** while speaking and release to stop. Flash-Lite optionally polishes
-the transcript, then the app pastes into the focused field.
+**Right Option** while speaking and release to stop. The key is configurable in Settings.
+Flash-Lite optionally polishes the transcript, then the app pastes into the focused field.
 
-The Gemini API key stays in the app process (loaded from an untracked `.env`). There is no localhost
-daemon or auth token.
+A dictation is never silently lost: the audio is recorded while it streams, and if Live drops,
+reconnects, or returns nothing, the recording is transcribed again when you stop. Recent
+transcripts (and the last few recordings) stay available from the menu bar.
+
+The Gemini API key is stored in your login Keychain (or the environment / an untracked `.env`) and
+used only by the app process. There is no localhost daemon or auth token.
 
 ## Architecture
 
 ```text
-Right Option
+Hotkey (Right Option by default)
         │
         ▼
 GeminiWhisper.app  ──microphone PCM16 16 kHz mono──► Gemini 3.5 Transcribe Live
-        │
-        ├─ interim HUD
-        ├─ optional Flash-Lite polish
-        └─ paste via in-process Cmd+V (or copy if focus moved)
+        │   └─ recorded in memory ──► batch transcription when Live cannot be trusted
+        ├─ interim HUD with input level
+        ├─ optional Flash-Lite polish (checked against the raw text, time-bounded)
+        └─ paste via in-process Cmd+V (clipboard kept when delivery is uncertain)
 ```
 
 ## Requirements
@@ -43,7 +47,9 @@ to enter the Gemini key privately and approve Apple's Microphone and Accessibili
 
 ## Build and run
 
-Put the key in an untracked `.env` (copy `.env.example`). Never commit or print `GEMINI_API_KEY`.
+Enter the key in **Settings → Gemini API key** (saved to the login Keychain), or put it in an
+untracked `.env` (copy `.env.example`); the bundled app moves a `.env` key into the Keychain on
+first launch. Never commit or print `GEMINI_API_KEY`.
 
 ```bash
 cd macos/GeminiWhisper
@@ -68,12 +74,27 @@ On first launch, grant:
 
 Click into a text field, then:
 
-1. Tap Right Option to begin. A HUD appears and a start sound plays.
+1. Tap Right Option to begin. A HUD appears and a start sound plays; the bar next to the
+   status shows the microphone level.
 2. Speak. Interim text shows in the HUD.
 3. Tap Right Option again to stop. The HUD switches to “Polishing with Gemini…”.
-4. Finished text is pasted into the original app; the previous clipboard is restored.
-   If focus moved, the transcript is copied instead.
-5. Press Escape to cancel without inserting.
+4. Finished text is pasted into the focused app. Your previous clipboard comes back about
+   1.5 seconds later, unless you copied something new in the meantime.
+5. Press Escape to cancel without inserting. The text stays in **Recent Transcripts**.
+
+When delivery is uncertain the transcript stays on the clipboard so ⌘V recovers it: no editable
+field could be confirmed through Accessibility, Secure Input is active, or the focused field did
+not change after the paste (you are notified). Password fields are never typed into.
+
+Recovery, from the menu bar:
+
+- **Copy Last Transcript** / **Paste Last Transcript**
+- **Retry Last Dictation from Audio** transcribes the last kept recording again (after a failed,
+  empty, cancelled, or interrupted dictation)
+- **Recent Transcripts** lists this session's dictations; choose one to copy it
+
+History lives in memory only and is cleared when the app quits. Closing the lid mid-dictation
+keeps it in history instead of pasting after wake.
 
 Sounds: Tink (start), Pop (stop / cancel / copied), Glass (pasted), Basso (error).
 
@@ -90,11 +111,44 @@ That compiles `TestingInteropStub.c` into `lib_TestingInterop.dylib` (required b
 Tools' Testing.framework), copies it next to the test binary, and runs
 `GeminiWhisperCoreTests --testing-library swift-testing`.
 
+The dictation lifecycle lives in `GeminiWhisperCore` (`DictationCoordinator`) behind small
+capture, insertion, and feedback protocols, so failure paths are tested without a Mac: socket
+drops, reconnect overflow, rotation, polish guard and deadline, back-to-back dictations, paste
+fallbacks, and recovery. With a Linux Swift toolchain:
+
+```bash
+cd macos/GeminiWhisper
+./scripts/run-core-tests-linux.sh                       # Core build + tests
+./scripts/run-core-tests-linux.sh --sanitize=thread     # with ThreadSanitizer
+```
+
 ## Settings
 
-The menu-bar extra → **Settings…** controls language, vocabulary, SMART vs verbatim, polish,
-VAD mode, VAD prefix/silence (defaults: manual, 500 ms prefix, 1500 ms silence), and microphone
-uniqueID. `:0` in `.env` means the system default input, not an ffmpeg device index.
+The menu-bar extra → **Settings…** controls the API key, the dictation key (Right/Left Option,
+Right Command, Right Control, Right Shift, or Fn/Globe), language, vocabulary, SMART vs verbatim,
+polish, VAD mode, VAD prefix/silence (defaults: manual, 500 ms prefix, 1500 ms silence), and
+microphone uniqueID. `:0` in `.env` means the system default input, not an ffmpeg device index.
+Plugging in or removing a headset, or changing the system default input, is picked up mid-session.
+
+### Reliability
+
+- **Live failures do not lose speech.** Every frame is recorded in memory while it streams. If Live
+  errors, overflows its reconnect buffer, reconnects mid-dictation, returns nothing although
+  speech was captured, or returns implausibly few words for the speech captured, the recording is
+  transcribed with `generateContent` (inline WAV, split at pauses into ≤4-minute chunks) when you
+  stop. Only a rejected API key stops a dictation early.
+- **Long dictations** hand over to a fresh Live session at a natural pause after 7 minutes
+  (or when Gemini sends `goAway`), finishing the old session gracefully, instead of hitting the
+  connection limit.
+- **Reconnects** back off exponentially and wait for a network route instead of spending their
+  attempts while offline.
+- **Merging** keeps genuinely repeated or parallel sentences: a final is only dropped as a resend
+  when it repeats the tail of the transcript and no new speech audio could explain it.
+- **Polish** is rejected when it answers the dictation, adds an assistant preamble, or drops or
+  invents most of the content, and stop waits at most 2.5 s plus 15 ms per word (8 s cap) before
+  inserting the raw transcript.
+- **Paste then repair** (Settings, off by default) inserts the raw text first and replaces it
+  only after Accessibility confirms that exact text is still in front of the cursor.
 
 ### Latency pipeline
 
@@ -129,8 +183,11 @@ of at least 160 words. It is disabled by default. Invalid revisions, duplicate/u
 IDs, or empty output fall back to a complete rewrite. Structural validation cannot establish
 semantic accuracy; compare this mode against full rewriting before using it routinely.
 
-Logs include audio-drain sample boundaries, polish revisions, request counts, and a final
-`latency` record separating `capture_ms`, `live_ms`, `polish_wait_ms`, and `delivery_ms`.
+Logs include audio-drain sample boundaries, polish revisions, request counts, a final
+`latency` record separating `capture_ms`, `live_ms`, `polish_wait_ms`, and `delivery_ms`, and one
+`outcome` line per dictation (`result=inserted|copied|empty|failed|cancelled|interrupted`, the
+transcript source, any batch recovery reason, audio and voiced milliseconds, reconnects, and
+rotations). The log rotates at 5 MB.
 `polish_wait_ms` is only the wait remaining after Live completion, not the full duration of
 a reused background request. Outcomes distinguish fresh work, ready/in-flight reuse, and
 raw fallback. Failed final polishing clears stale polish metadata.
@@ -144,7 +201,9 @@ python3 scripts/summarize-latency.py --since 2026-09-06T17:08:21Z --last 0
 ```
 
 The report includes raw fallback in overall latency and labels it separately when new timing
-records are available. It excludes copy-only events. Older logs have unknown outcomes. The paste metric measures posting the shortcut, not verified
+records are available. Its `reliability` section counts delivered, recovered-to-clipboard,
+failed (audio kept for retry), empty, and abandoned dictations, the delivered rate, batch
+recoveries by reason, and stop-to-paste p50/p95. It excludes copy-only events. Older logs have unknown outcomes. The paste metric measures posting the shortcut, not verified
 text rendering in another application. A slow Live response is no longer cut off at 1.2 seconds;
 the existing 3.5-second hard fallback can still return incomplete raw text on upstream failure.
 Offline tests cover orchestration, not model quality or microphone accuracy. No measured
@@ -152,7 +211,9 @@ speedup or parity with Wispr Flow is implied.
 
 ## Security
 
-- The API key is loaded only by the app process from `.env` or the environment. It is never logged.
+- The API key is read only by the app process, from the login Keychain, the environment, or `.env`.
+  It is never logged and never copied into the app bundle.
+- Dictation audio is held in memory (the last three recordings, for retry) and never written to disk.
 - There is no localhost daemon or per-user auth token.
 - `.env`, `.build/`, and generated `.app` bundles are gitignored.
 - This is a same-user desktop app. See [SECURITY.md](SECURITY.md).
@@ -165,15 +226,16 @@ Implemented:
 - SMART cleanup or verbatim transcription
 - Language hint and custom vocabulary
 - Automatic / hybrid / manual VAD
-- Microphone capture with 100 ms realtime audio frames
-- Right Option toggle, Escape cancel, HUD, paste/copy
+- Microphone capture with 40 ms realtime audio frames, following device changes
+- Configurable hotkey toggle/hold, Escape cancel, HUD, paste/copy
+- Recording-based recovery, Live session rotation, in-memory transcript history
 
 Not yet included:
 
 - App-aware writing styles
 - Snippet expansion and spoken commands
-- Long-running session rotation
-- Transcript persistence
+- Transcript persistence across launches
+- Live session resumption handles (rotation starts a fresh session)
 
 ## License
 
